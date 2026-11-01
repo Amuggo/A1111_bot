@@ -1,0 +1,64 @@
+# A1111 Telegram Bot
+
+Telegram-бот для генерации и редактирования изображений через локальный
+[Stable Diffusion WebUI (AUTOMATIC1111)](https://github.com/AUTOMATIC1111/stable-diffusion-webui).
+
+## Возможности
+
+- **Быстрая генерация** — любой текст превращается в картинку (txt2img); есть расширенный режим.
+- **Персональные настройки** — разрешение, CFG, шаги, сэмплер, negative prompt, режим разнообразия, LoRA.
+- **Выбор модели (checkpoint)** — список берётся из API WebUI (`/sdapi/v1/sd-models`); выбор в «⚙️ Настройки → 🧩 Модель» или командой `/model`. Модель у каждого пользователя своя и передаётся в каждый запрос (`override_settings`). Пользователи без выбора работают на модели по умолчанию: `SD_DEFAULT_MODEL` из `.env`, иначе модель, загруженная в WebUI при запуске бота.
+- **Апскейл любого фото** — просто пришлите картинку (лучше «как файл», без сжатия Telegram), выберите 2x/3x/4x, результат придёт файлом.
+- **Обработка промптов через Ollama** (опционально) — перевод и улучшение промпта (`aya:8b` по умолчанию).
+- **ControlNet** — позы и референсы из Parquet-датасетов (`code/controlnet_images/<категория>/`).
+- **Замена лица (ReActor)** — несколько сохранённых лиц, выбор активного.
+- **Редактирование** — img2img, инпейнт, апскейл; тело/одежда/фон/поза через сегментацию (OpenCV + MediaPipe).
+- **ADetailer** — автодоработка лиц и рук.
+- **Лог промптов** — каждый запрос печатается в консоль бота строкой `@пользователь : промпт`, а также пишется в `code/data/prompt_log.jsonl`; последние записи — команда `/prompts` (только для администратора, если задан `ADMIN_USER_ID`).
+
+## Установка
+
+```bash
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+
+cp .env.example .env            # и заполните значения
+```
+
+Обязательно в `.env`: `TELEGRAM_BOT_TOKEN` (получить у [@BotFather](https://t.me/BotFather)).
+Остальные переменные описаны в `.env.example`.
+
+## Запуск
+
+1. Запустите A1111 с флагом `--api` (адрес по умолчанию `http://127.0.0.1:7860`).
+2. (Опционально) запустите Ollama и скачайте модель: `ollama pull aya:8b`.
+3. Запустите бота:
+
+```bash
+python code/main.py
+```
+
+## Структура
+
+| Файл | Назначение |
+|------|-----------|
+| `code/main.py` | Хендлеры Telegram, клавиатуры, основная логика бота |
+| `code/Aapi.py` | Клиент A1111 API: txt2img, img2img, inpaint, апскейл, ReActor, LoRA, ADetailer |
+| `code/app_config.py` | Загрузка `.env` и общие пути |
+| `code/settings.py` | Пользовательские настройки, LoRA, сэмплеры |
+| `code/controlnet_manager.py`, `controlnet_settings.py` | Каталог и генерация через ControlNet |
+| `code/face_manager.py` | Хранилище лиц и замена через ReActor |
+| `code/segmentation.py` | Маски тела/фона/одежды, карта позы |
+| `code/prompt_processor.py` | Обработка промптов через Ollama |
+| `code/prompt_logger.py` | Лог промптов пользователей |
+| `code/embeddings_manager.py` | Загрузка рекомендуемых embeddings (путь — `A1111_BASE_PATH`) |
+| `code/adetailer_settings.py` | Настройки ADetailer |
+
+Вспомогательные утилиты (запускаются вручную из папки `code/`):
+`check_api_endpoints.py` — проверка доступных эндпоинтов A1111,
+`check_controlnet.py` — проверка каталога ControlNet,
+`quick_rename.py` — переименование поз в датасете.
+
+Пользовательские данные (настройки, лица, лог) хранятся в `DATA_DIR`
+(по умолчанию `code/data/`) и не попадают в git.

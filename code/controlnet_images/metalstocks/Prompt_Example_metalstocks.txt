@@ -1,0 +1,9 @@
+<Prompt Example>
+photo of a woman,completely nude,happy,sitting,spread legs,bondage,shackles,ankle cuffs,wrist cuffs,ray tracing,detail shadow,shot on Fujifilm X-T4,85mm f1.2,sharp focus,depth of field,blurry background,bakeh,
+
+<Prompt Example with Lora>
+photo of a woman,completely nude,happy,sitting,spread legs,metalstocks,bondage,shackles,ankle cuffs,wrist cuffs,<lora:metalstocks2-03:0.8>,ray tracing,detail shadow,shot on Fujifilm X-T4,85mm f1.2,sharp focus,depth of field,blurry background,bakeh,
+
+<Lora Suggested>
+Joschek's Metal Bondage: Stocks (BDSM Series, experimental)
+https://civitai.com/models/287836/joscheks-metal-bondage-stocks-bdsm-series-experimental

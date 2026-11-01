@@ -1,0 +1,22 @@
+# Окружение Python
+venv/
+.venv/
+.env
+
+# Кэш компиляции
+__pycache__/
+*.pyc
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.vsidx
+*.sqlite
+
+# Данные бота (настройки пользователей, лица, лог промптов)
+code/data/
+
+# Временные файлы
+*.log
+output/
