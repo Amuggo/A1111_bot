@@ -9,7 +9,7 @@ import urllib.error
 from typing import Dict, List, Optional, Callable, Tuple, Any
 
 # Импорт из settings и embeddings_manager
-from settings import get_user_negative_prompt, get_diversity_mode, get_use_advanced_negative, get_prompt_processing_enabled, get_active_lora_tags, resolve_model
+from settings import get_user_negative_prompt, get_diversity_mode, get_use_advanced_negative, get_prompt_processing_enabled, get_active_lora_tags, resolve_model, get_user_negative_embeddings
 from embeddings_manager import get_negative_prompt_with_embeddings
 from prompt_processor import fast_process
 
@@ -427,7 +427,12 @@ def enhance_prompt_for_diversity(prompt: str, user_id: str, user_settings: dict)
 
 
 def build_negative_prompt(user_id: str, custom_negative: str = None) -> str:
-    """Формирует финальный негативный промпт с учётом эмбеддингов и дополнительных анти-мутационных фраз"""
+    """Формирует финальный негативный промпт с учётом эмбеддингов и дополнительных анти-мутационных фраз.
+
+    Негативные эмбеддинги получаются из API WebUI (/sdapi/v1/embeddings):
+    пользователь может добавлять и удалять их через UI (настройки бота).
+    Выбор хранится в настройках ("ключ negative_embeddings") и подмешивается здесь.
+    """
     use_advanced = get_use_advanced_negative(user_id)
     
     if custom_negative:
@@ -440,7 +445,11 @@ def build_negative_prompt(user_id: str, custom_negative: str = None) -> str:
     if extra_neg not in user_negative:
         user_negative = f"{user_negative}, {extra_neg}"
     
-    return get_negative_prompt_with_embeddings(user_negative, use_advanced)
+    # Выбранные пользователем негативные эмбеддинги (из API WebUI)
+    selected_embeddings = get_user_negative_embeddings(user_id)
+
+    return get_negative_prompt_with_embeddings(user_negative, use_advanced,
+                                               selected_embeddings=selected_embeddings)
 
 
 def generate_txt2img(

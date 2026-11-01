@@ -38,11 +38,17 @@ from settings import (
     DEFAULT_SETTINGS, DEFAULT_NEGATIVE_PROMPT, get_diversity_mode,
     get_prompt_processing_enabled, set_prompt_processing_enabled,
     set_diversity_mode, set_user_negative_prompt,
+    get_user_negative_embeddings, add_user_negative_embedding, remove_user_negative_embedding,
+    set_user_negative_embeddings,
     get_user_lora_enabled, set_user_lora_enabled, get_available_loras,
     set_available_loras, get_user_lora_enabled, set_user_lora_enabled,
     fetch_loras_from_api,
     get_available_models, refresh_checkpoints_on_server, get_user_model,
     set_user_model, get_default_model, get_default_model_name
+)
+from embeddings_manager import (
+    get_available_embeddings, fetch_embeddings_from_api, filter_negative_embeddings,
+    refresh_embeddings_on_server
 )
 from face_manager import (
     save_user_face, get_user_faces, get_active_face, set_active_face,
@@ -211,6 +217,9 @@ def get_settings_inline_keyboard(settings, user_id):
     prompt_text = "🤖 Обработка: ✅ Вкл" if prompt_processing else "🤖 Обработка: ❌ Выкл"
     btn_prompt = types.InlineKeyboardButton(prompt_text, callback_data="toggle_prompt_processing")
     btn_lora = types.InlineKeyboardButton("🎛️ LoRA", callback_data="manage_lora")
+    neg_embeddings_count = len(get_user_negative_embeddings(user_id))
+    emb_label = f"🧨 Негативные эмбеддинги{f': {neg_embeddings_count} ✅' if neg_embeddings_count else ''}"
+    btn_embeddings = types.InlineKeyboardButton(emb_label, callback_data="manage_neg_embeddings")
     model_label = _model_display_name(user_id)
     if len(model_label) > 30:
         model_label = model_label[:29] + "…"
@@ -221,6 +230,7 @@ def get_settings_inline_keyboard(settings, user_id):
     markup.add(btn_sampler, btn_neg)  # <--- Добавляем кнопку сэмплера
     markup.add(btn_diversity, btn_prompt)
     markup.add(btn_lora)
+    markup.add(btn_embeddings)
     return markup
 
 def get_resolution_keyboard(current_width, current_height):
@@ -2274,6 +2284,111 @@ def handle_refresh_lora(call):
 def handle_back_to_settings(call):
     show_settings(call.message)
     bot.answer_callback_query(call.id)
+
+# =========== ОБРАБОТЧИКИ НЕГАТИВНЫХ ЭМБЕДДИНГОВ (из API WebUI) ===========
+
+def get_neg_embeddings_keyboard(user_id):
+    """Клавиатура управления негативными эмбеддингами, полученными из API (/sdapi/v1/embeddings).
+
+    Нажатие на эмбеддинг добавляет его в негативный промпт пользователя, повторное
+    нажатие — удаляет. Отфильтрованы только эмбеддинги, похожие на негативные.
+    """
+    available = get_available_embeddings()
+    negative_names = filter_negative_embeddings(available)
+    selected = set(get_user_negative_embeddings(user_id))
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    for name in negative_names:
+        status = "✅" if name in selected else "❌"
+        shape = int((available.get(name) or {}).get("shape") or 0)
+        label = f"{status} {name}" + (f" [{shape}]" if shape else "")
+        markup.add(types.InlineKeyboardButton(label, callback_data=f"neg_emb_toggle_{name}"))
+
+    markup.add(types.InlineKeyboardButton("🔄 Обновить список эмбеддингов", callback_data="refresh_neg_embeddings"))
+    markup.add(types.InlineKeyboardButton("❌ Очистить выбранные", callback_data="clear_neg_embeddings"))
+    markup.add(types.InlineKeyboardButton("◀️ Назад в настройки", callback_data="back_to_settings"))
+    return markup, len(negative_names), sorted(selected, key=str.lower)
+
+
+def show_neg_embeddings_menu(message_or_call):
+    """Отправляет/редактирует сообщение с меню негативных эмбеддингов."""
+    if hasattr(message_or_call, "message"):  # callback_query
+        chat_id = message_or_call.message.chat.id
+        message_id = message_or_call.message.message_id
+        user_id = str(chat_id)
+    else:  # message
+        chat_id = message_or_call.chat.id
+        message_id = None
+        user_id = str(chat_id)
+
+    markup, total, selected = get_neg_embeddings_keyboard(user_id)
+
+    if total == 0:
+        text = (
+            "🧨 **Негативные эмбеддинги**\n\n"
+            "API не вернул ни одного эмбеддинга, похожего на негативный.\n"
+            "Проверьте, что WebUI запущен с --api и файлы .pt/.safetensors лежат в папке embeddings."
+        )
+    else:
+        sel_text = "\n".join(f"`{s}`" for s in selected) if selected else "_ничего не выбрано_"
+        text = (
+            "🧨 **Негативные эмбеддинги из API**\n\n"
+            f"Найдено: {total}. Нажми на эмбеддинг — он добавится в негативный промпт, повторное нажатие — уберёт его оттуда.\n\n"
+            "**Выбрано в негативе:**\n" + sel_text
+        )
+
+    if message_id is not None:
+        try:
+            bot.edit_message_text(text, chat_id, message_id, parse_mode="Markdown", reply_markup=markup)
+            return
+        except Exception as e:
+            if "message is not modified" in str(e):
+                return
+    bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "manage_neg_embeddings")
+def handle_manage_neg_embeddings(call):
+    bot.answer_callback_query(call.id)
+    show_neg_embeddings_menu(call)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("neg_emb_toggle_"))
+def handle_neg_emb_toggle(call):
+    user_id = str(call.message.chat.id)
+    emb_name = call.data.replace("neg_emb_toggle_", "", 1)
+    available = get_available_embeddings()
+    if emb_name not in available:
+        bot.answer_callback_query(call.id, "❌ Эмбеддинг не найден в API", show_alert=True)
+        return
+    current = get_user_negative_embeddings(user_id)
+    if emb_name in current:
+        remove_user_negative_embedding(user_id, emb_name)
+        bot.answer_callback_query(call.id, f"Негативный эмбеддинг {emb_name} удалён из промпта ❌")
+    else:
+        add_user_negative_embedding(user_id, emb_name)
+        bot.answer_callback_query(call.id, f"Негативный эмбеддинг {emb_name} добавлен в промпт ✅")
+    show_neg_embeddings_menu(call)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "refresh_neg_embeddings")
+def handle_refresh_neg_embeddings(call):
+    bot.answer_callback_query(call.id, "🔄 Обновляю список...")
+    refresh_embeddings_on_server()
+    new_list = fetch_embeddings_from_api(force_refresh=True)
+    if new_list:
+        show_neg_embeddings_menu(call)
+    else:
+        bot.send_message(call.message.chat.id, "❌ Не удалось получить список эмбеддингов из API")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "clear_neg_embeddings")
+def handle_clear_neg_embeddings(call):
+    user_id = str(call.message.chat.id)
+    removed = len(get_user_negative_embeddings(user_id))
+    set_user_negative_embeddings(user_id, [])
+    bot.answer_callback_query(call.id, f"❌ Убрано из негативного промпта: {removed}")
+    show_neg_embeddings_menu(call)
 
 # =========== ЗАПУСК БОТА ===========
 
