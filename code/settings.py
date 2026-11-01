@@ -126,6 +126,53 @@ def set_user_negative_prompt(user_id: str, neg_prompt: str):
         settings["negative_prompt"] = neg_prompt
     save_user_settings(user_id, settings)
 
+
+# ===== НЕГАТИВНЫЕ ЭМБЕДДИНГИ ПОЛЬЗОВАТЕЛЯ =====
+# Список имён негативных эмбеддингов (полученных из API WebUI), которые пользователь
+# добавил в свой негативный промпт. Хранится в настройках пользователя в ключе
+# "negative_embeddings" и подмешивается к финальному негативу при генерации.
+
+def get_user_negative_embeddings(user_id: str) -> list:
+    """Возвращает список имён негативных эмбеддингов, выбранных пользователем."""
+    settings = get_user_settings(user_id)
+    embeddings = settings.get("negative_embeddings") or []
+    # Фильтруем по актуальному списку из API (если он доступен), чтобы не тянуть удалённые
+    try:
+        from embeddings_manager import get_available_embeddings
+        available = get_available_embeddings()
+        if available:
+            embeddings = [e for e in embeddings if e in available]
+    except Exception:
+        pass
+    return list(embeddings)
+
+
+def set_user_negative_embeddings(user_id: str, embeddings: list):
+    """Сохраняет список негативных эмбеддингов пользователя."""
+    settings = get_user_settings(user_id)
+    settings["negative_embeddings"] = list(embeddings or [])
+    save_user_settings(user_id, settings)
+
+
+def add_user_negative_embedding(user_id: str, embedding_name: str) -> bool:
+    """Добавляет негативный эмбеддинг в промпт пользователя (без дублей)."""
+    embeddings = get_user_negative_embeddings(user_id)
+    if embedding_name in embeddings:
+        return False
+    embeddings.append(embedding_name)
+    set_user_negative_embeddings(user_id, embeddings)
+    return True
+
+
+def remove_user_negative_embedding(user_id: str, embedding_name: str) -> bool:
+    """Убирает негативный эмбеддинг из промпта пользователя."""
+    embeddings = get_user_negative_embeddings(user_id)
+    if embedding_name not in embeddings:
+        return False
+    embeddings = [e for e in embeddings if e != embedding_name]
+    set_user_negative_embeddings(user_id, embeddings)
+    return True
+
 def get_diversity_mode(user_id: str) -> str:
     settings = get_user_settings(user_id)
     return settings.get("diversity_mode", "auto")
