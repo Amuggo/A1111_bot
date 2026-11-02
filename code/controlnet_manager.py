@@ -14,7 +14,7 @@ from settings import get_active_lora_tags
 import pandas as pd
 
 # Импортируем общие утилиты из Aapi (прогресс, негативный промпт)
-from Aapi import generate_with_progress, build_negative_prompt, apply_model_override
+from Aapi import generate_with_progress, build_negative_prompt, apply_model_override, fit_dims_to_image, MAX_SEED
 
 # ===== КОНФИГУРАЦИЯ =====
 CONTROLNET_IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "controlnet_images")
@@ -254,7 +254,8 @@ def generate_controlnet(
     module: str,
     model: str,
     settings: dict,
-    progress_callback: Optional[Callable[[float, float], None]] = None
+    progress_callback: Optional[Callable[[float, float], None]] = None,
+    user_id: str = "default"
 ) -> io.BytesIO:
     """
     Генерация с ControlNet (img2img).
@@ -273,8 +274,9 @@ def generate_controlnet(
         raise Exception(f"ControlNet: {e}")
     control_base64 = base64.b64encode(control_bytes).decode('utf-8')
 
-    # --- Валидация размеров ---
+    # --- Валидация размеров: результат повторяет пропорции исходной картинки ---
     w, h = _safe_dims(settings)
+    w, h = fit_dims_to_image(init_bytes, w, h)
 
     controlnet_args = [{
         "input_image": control_base64,
@@ -295,14 +297,14 @@ def generate_controlnet(
     payload = {
         "init_images": [init_base64],
         "prompt": prompt,
-        "negative_prompt": build_negative_prompt("default"),
+        "negative_prompt": build_negative_prompt(user_id),
         "denoising_strength": settings.get("denoising_strength", 0.7),
         "steps": settings.get("steps", 20),
         "width": w,
         "height": h,
         "cfg_scale": settings.get("cfg_scale", 7.0),
         "sampler_name": settings.get("sampler_name", "Euler a"),
-        "seed": random.randint(1, 2**32),
+        "seed": random.randint(1, MAX_SEED),
         "batch_size": 1,
         "alwayson_scripts": {
             "ControlNet": {
@@ -318,7 +320,8 @@ def generate_controlnet(
     )
 
     apply_model_override(payload, settings)
-    response = generate_with_progress(payload, progress_callback)
+    # img2img-запрос должен идти на img2img (раньше по ошибке — на txt2img, и init_images игнорировались)
+    response = generate_with_progress(payload, progress_callback, endpoint="sdapi/v1/img2img")
     images = response.get('images', [])
     if not images:
         raise Exception("API не вернул изображений")
@@ -378,6 +381,7 @@ def generate_txt2img_controlnet(
         "control_mode": "Balanced",
     }
 
+    seed = random.randint(1, MAX_SEED)
     payload = {
         "prompt": prompt,
         "negative_prompt": build_negative_prompt(user_id),
@@ -386,7 +390,7 @@ def generate_txt2img_controlnet(
         "height": h,
         "cfg_scale": settings.get("cfg_scale", 6.0),
         "sampler_name": settings.get("sampler_name", "DPM++ 2M"),
-        "seed": random.randint(1, 2**32),
+        "seed": seed,
         "batch_size": 1,
         "n_iter": 1,
         "alwayson_scripts": {
@@ -413,4 +417,5 @@ def generate_txt2img_controlnet(
     image_bytes = base64.b64decode(img_base64)
     image_file = io.BytesIO(image_bytes)
     image_file.name = "controlnet_txt2img.png"
+    image_file.seed = seed  # main.py показывает seed в подписи
     return image_file

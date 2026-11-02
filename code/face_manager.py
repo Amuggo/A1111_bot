@@ -4,9 +4,11 @@
 """
 
 import os
-import json
 import io
+import threading
 from typing import List, Dict, Optional
+
+from storage import JsonStore
 
 try:
     import app_config as config
@@ -18,6 +20,11 @@ except ImportError:
     FACE_SETTINGS_FILE = os.environ.get("FACE_SETTINGS_FILE", "face_settings.json")
 os.makedirs(FACES_DIR, exist_ok=True)
 
+# Настройки лиц читаются/пишутся только через это хранилище (потокобезопасно, запись атомарная),
+# а операции с файлами лиц (сохранить/удалить/переименовать) сериализуются общей блокировкой.
+_FACE_STORE = JsonStore(FACE_SETTINGS_FILE)
+_FACE_FILES_LOCK = threading.RLock()
+
 
 def _face_path(user_id: str, face_name: str) -> str:
     """Путь к файлу лица. Защита от выхода за пределы папки пользователя (../ и т.п.)."""
@@ -28,85 +35,80 @@ def _face_path(user_id: str, face_name: str) -> str:
 
 def load_face_settings() -> dict:
     """Загружает настройки лиц всех пользователей"""
-    if os.path.exists(FACE_SETTINGS_FILE):
-        try:
-            with open(FACE_SETTINGS_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError) as e:
-            print(f"Ошибка загрузки настроек лиц: {e}")
-            return {}
-    return {}
+    return _FACE_STORE.read()
 
 
 def save_face_settings(settings: dict):
-    """Сохраняет настройки лиц всех пользователей"""
-    try:
-        with open(FACE_SETTINGS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(settings, f, indent=2, ensure_ascii=False)
-    except IOError as e:
-        print(f"Ошибка сохранения настроек лиц: {e}")
+    """Полностью заменяет настройки лиц (оставлено для совместимости; для правок используйте _update_user_face_settings)."""
+    _FACE_STORE.write(settings)
+
+
+def _update_user_face_settings(user_id: str, mutator):
+    """Атомарно изменяет запись пользователя; возвращает результат mutator."""
+    user_id = str(user_id)
+
+    def _mutator(all_settings: dict):
+        entry = all_settings.setdefault(user_id, {"face_enabled": False, "active_face": None})
+        entry.setdefault("face_enabled", False)
+        entry.setdefault("active_face", None)
+        return mutator(entry)
+
+    return _FACE_STORE.update(_mutator)
 
 
 def get_face_enabled(user_id: str) -> bool:
     """Получает статус включения замены лиц для пользователя"""
-    settings = load_face_settings()
-    if user_id not in settings:
-        settings[user_id] = {"face_enabled": False, "active_face": None}
-        save_face_settings(settings)
-    return settings[user_id].get("face_enabled", False)
+    return bool(_update_user_face_settings(user_id, lambda entry: entry.get("face_enabled", False)))
 
 
 def set_face_enabled(user_id: str, enabled: bool):
     """Устанавливает статус включения замены лиц"""
-    settings = load_face_settings()
-    if user_id not in settings:
-        settings[user_id] = {"face_enabled": False, "active_face": None}
-    settings[user_id]["face_enabled"] = enabled
-    save_face_settings(settings)
+    _update_user_face_settings(user_id, lambda entry: entry.__setitem__("face_enabled", bool(enabled)))
 
 
 def get_active_face_name(user_id: str) -> Optional[str]:
     """Получает имя активного лица пользователя"""
-    settings = load_face_settings()
-    return settings.get(user_id, {}).get("active_face")
+    return load_face_settings().get(str(user_id), {}).get("active_face")
 
 
 def get_active_face(user_id: str) -> Optional[io.BytesIO]:
     """Получает активное лицо пользователя как BytesIO"""
     active_face_name = get_active_face_name(user_id)
-    
+
     if active_face_name:
-        face_path = _face_path(user_id, active_face_name)
-        if os.path.exists(face_path):
-            with open(face_path, 'rb') as f:
-                return io.BytesIO(f.read())
+        try:
+            face_path = _face_path(user_id, active_face_name)
+            with _FACE_FILES_LOCK:
+                if os.path.exists(face_path):
+                    with open(face_path, 'rb') as f:
+                        return io.BytesIO(f.read())
+        except (ValueError, OSError) as e:
+            print(f"Не удалось прочитать активное лицо: {e}")
     return None
 
 
 def set_active_face(user_id: str, face_name: str) -> bool:
     """Устанавливает активное лицо"""
-    settings = load_face_settings()
-    if user_id not in settings:
-        settings[user_id] = {"face_enabled": False, "active_face": None}
-    
-    # Проверяем, существует ли такое лицо
-    face_path = _face_path(user_id, face_name)
-    if os.path.exists(face_path):
-        settings[user_id]["active_face"] = face_name
-        save_face_settings(settings)
+    try:
+        face_path = _face_path(user_id, face_name)
+    except ValueError:
+        return False
+    with _FACE_FILES_LOCK:
+        if not os.path.exists(face_path):
+            return False
+        _update_user_face_settings(user_id, lambda entry: entry.__setitem__("active_face", face_name))
         return True
-    return False
 
 
 def get_user_faces(user_id: str) -> List[Dict]:
     """Получает список лиц пользователя с их статусами"""
-    user_dir = os.path.join(FACES_DIR, user_id)
+    user_dir = os.path.join(FACES_DIR, str(user_id))
     faces = []
-    
+
     active_face_name = get_active_face_name(user_id)
-    
+
     if os.path.exists(user_dir):
-        for filename in os.listdir(user_dir):
+        for filename in sorted(os.listdir(user_dir)):
             if filename.endswith('.jpg'):
                 name = filename[:-4]  # Убираем .jpg
                 faces.append({
@@ -120,15 +122,15 @@ def get_user_faces(user_id: str) -> List[Dict]:
 def save_user_face(user_id: str, image: io.BytesIO, face_name: str) -> bool:
     """Сохраняет лицо пользователя"""
     try:
-        user_dir = os.path.join(FACES_DIR, user_id)
-        os.makedirs(user_dir, exist_ok=True)
-        
-        face_path = os.path.join(user_dir, f"{face_name}.jpg")
+        face_path = _face_path(user_id, face_name)  # проверка имени (без ../ и т.п.)
         image.seek(0)
-        
-        with open(face_path, 'wb') as f:
-            f.write(image.read())
-        
+        data = image.read()
+        with _FACE_FILES_LOCK:
+            os.makedirs(os.path.dirname(face_path), exist_ok=True)
+            tmp_path = face_path + ".tmp"
+            with open(tmp_path, 'wb') as f:
+                f.write(data)
+            os.replace(tmp_path, face_path)  # атомарно: файл либо старый, либо новый целиком
         return True
     except Exception as e:
         print(f"Ошибка сохранения лица: {e}")
@@ -139,19 +141,18 @@ def delete_face(user_id: str, face_name: str) -> bool:
     """Удаляет лицо пользователя"""
     try:
         face_path = _face_path(user_id, face_name)
-        if os.path.exists(face_path):
+        with _FACE_FILES_LOCK:
+            if not os.path.exists(face_path):
+                return False
             os.remove(face_path)
-            
-            # Если удалили активное лицо, сбрасываем его
-            current_active = get_active_face_name(user_id)
-            if current_active == face_name:
-                settings = load_face_settings()
-                if user_id in settings:
-                    settings[user_id]["active_face"] = None
-                    save_face_settings(settings)
-            
+
+            # Если удалили активное лицо, сбрасываем его (атомарно)
+            def reset_active(entry: dict):
+                if entry.get("active_face") == face_name:
+                    entry["active_face"] = None
+
+            _update_user_face_settings(user_id, reset_active)
             return True
-        return False
     except Exception as e:
         print(f"Ошибка удаления лица: {e}")
         return False
@@ -162,20 +163,19 @@ def rename_face(user_id: str, old_name: str, new_name: str) -> bool:
     try:
         old_path = _face_path(user_id, old_name)
         new_path = _face_path(user_id, new_name)
-        
-        if os.path.exists(old_path):
+
+        with _FACE_FILES_LOCK:
+            if not os.path.exists(old_path) or os.path.exists(new_path):
+                return False
             os.rename(old_path, new_path)
-            
-            # Обновляем активное лицо если нужно
-            current_active = get_active_face_name(user_id)
-            if current_active == old_name:
-                settings = load_face_settings()
-                if user_id in settings:
-                    settings[user_id]["active_face"] = new_name
-                    save_face_settings(settings)
-            
+
+            # Обновляем активное лицо если нужно (атомарно)
+            def follow_rename(entry: dict):
+                if entry.get("active_face") == old_name:
+                    entry["active_face"] = new_name
+
+            _update_user_face_settings(user_id, follow_rename)
             return True
-        return False
     except Exception as e:
         print(f"Ошибка переименования: {e}")
         return False
@@ -183,10 +183,14 @@ def rename_face(user_id: str, old_name: str, new_name: str) -> bool:
 
 def get_face_preview(user_id: str, face_name: str) -> Optional[io.BytesIO]:
     """Возвращает превью лица"""
-    face_path = _face_path(user_id, face_name)
-    if os.path.exists(face_path):
-        with open(face_path, 'rb') as f:
-            return io.BytesIO(f.read())
+    try:
+        face_path = _face_path(user_id, face_name)
+        with _FACE_FILES_LOCK:
+            if os.path.exists(face_path):
+                with open(face_path, 'rb') as f:
+                    return io.BytesIO(f.read())
+    except (ValueError, OSError) as e:
+        print(f"Не удалось прочитать превью лица: {e}")
     return None
 
 

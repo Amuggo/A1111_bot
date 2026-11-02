@@ -6,6 +6,7 @@
 import requests
 import json
 import subprocess
+import threading
 import time
 import sys
 import os
@@ -22,6 +23,9 @@ class PromptProcessor:
         self.model = os.environ.get("OLLAMA_MODEL", "aya:8b")  # или "phi3:mini" для экономии VRAM
         self.ollama_process = None
         self.model_loaded = False
+        # Запросы к Ollama выполняются по одному: иначе один поток выгружает модель (keep_alive=0),
+        # пока другой ещё ждёт ответа, а оба потока могли одновременно запустить `ollama serve`.
+        self._lock = threading.Lock()
     
     def _is_ollama_running(self) -> bool:
         """Проверяет, запущен ли Ollama сервер"""
@@ -157,7 +161,11 @@ class PromptProcessor:
         """
         if not prompt or len(prompt.strip()) < 2:
             return prompt
-        
+
+        with self._lock:
+            return self._process_locked(prompt)
+
+    def _process_locked(self, prompt: str) -> str:
         try:
             # 1. Запускаем сервер
             self._start_ollama_server()
@@ -209,8 +217,11 @@ class PromptProcessor:
             
             if response.status_code == 200:
                 result = response.json()
-                translated = result.get("response", prompt).strip()
-                translated = translated.strip('"\'')
+                translated = (result.get("response") or "").strip()
+                translated = translated.strip('"\'').strip()
+                if not translated:  # пустой ответ модели — лучше исходный промпт, чем пустая генерация
+                    print("⚠️ Ollama вернул пустой ответ, использую исходный промпт")
+                    return prompt
                 print(f"✅ Результат: {translated}")
                 return translated
             else:

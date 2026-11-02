@@ -11,6 +11,7 @@ from face_manager import rename_face
 import json
 import html
 import hashlib
+import threading
 from PIL import Image
 
 try:
@@ -38,17 +39,14 @@ from settings import (
     DEFAULT_SETTINGS, DEFAULT_NEGATIVE_PROMPT, get_diversity_mode,
     get_prompt_processing_enabled, set_prompt_processing_enabled,
     set_diversity_mode, set_user_negative_prompt,
-    get_user_negative_embeddings, add_user_negative_embedding, remove_user_negative_embedding,
-    set_user_negative_embeddings,
     get_user_lora_enabled, set_user_lora_enabled, get_available_loras,
     set_available_loras, get_user_lora_enabled, set_user_lora_enabled,
     fetch_loras_from_api,
     get_available_models, refresh_checkpoints_on_server, get_user_model,
-    set_user_model, get_default_model, get_default_model_name
-)
-from embeddings_manager import (
-    get_available_embeddings, fetch_embeddings_from_api, filter_negative_embeddings,
-    refresh_embeddings_on_server
+    set_user_model, get_default_model, get_default_model_name,
+    update_user_settings, get_available_embeddings, refresh_embeddings_on_server,
+    get_user_negative_embeddings, toggle_user_negative_embedding, set_user_negative_embeddings,
+    get_available_samplers, get_user_sampler, set_user_sampler
 )
 from face_manager import (
     save_user_face, get_user_faces, get_active_face, set_active_face,
@@ -87,7 +85,13 @@ if not BOT_TOKEN:
     )
     sys.exit(1)
 
-bot = telebot.TeleBot(BOT_TOKEN)
+# Число рабочих потоков telebot. Раньше было 2 (по умолчанию): две долгие генерации одновременно блокировали
+# весь бот, включая кнопки меню. Можно изменить переменной окружения BOT_WORKER_THREADS.
+try:
+    _WORKER_THREADS = max(2, int(os.environ.get("BOT_WORKER_THREADS", "8")))
+except ValueError:
+    _WORKER_THREADS = 8
+bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=_WORKER_THREADS)
 
 # Запоминаем @username авторов сообщений и нажатий кнопок ДО вызова хендлеров,
 # чтобы лог промптов («пользователь : промпт») знал имя пользователя.
@@ -109,14 +113,66 @@ bot.process_new_callback_query = _process_new_callback_query_with_names
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Глобальные словари для хранения данных
-last_images = {}
-last_message_ids = {}
-last_seeds = {}
-last_configs = {}
-temp_data = {}
-pagination_data = {}
-preview_messages = {}  # user_id -> message_id сообщения с превью
+class SafeStore:
+    """
+    Потокобезопасный словарь с ограничением размера.
+    telebot обрабатывает апдейты в нескольких потоках, поэтому обычные dict'ы со сложными операциями
+    («проверить — создать — записать») давали гонки и KeyError. Здесь каждая операция атомарна, а при
+    переполнении вытесняются самые старые записи (раньше last_images росли без ограничений и держали в
+    памяти десятки мегабайт на пользователя).
+    """
+
+    def __init__(self, maxsize=500):
+        self._data = {}
+        self._lock = threading.RLock()
+        self._maxsize = maxsize
+
+    def __getitem__(self, key):
+        with self._lock:
+            return self._data[key]
+
+    def __setitem__(self, key, value):
+        with self._lock:
+            self._data.pop(key, None)  # обновлённая запись становится самой свежей
+            self._data[key] = value
+            while len(self._data) > self._maxsize:
+                self._data.pop(next(iter(self._data)))
+
+    def __delitem__(self, key):
+        with self._lock:
+            del self._data[key]
+
+    def __contains__(self, key):
+        with self._lock:
+            return key in self._data
+
+    def __len__(self):
+        with self._lock:
+            return len(self._data)
+
+    def get(self, key, default=None):
+        with self._lock:
+            return self._data.get(key, default)
+
+    def pop(self, key, *default):
+        with self._lock:
+            return self._data.pop(key, *default)
+
+    def setdefault(self, key, default=None):
+        with self._lock:
+            if key not in self._data:
+                self[key] = default
+            return self._data[key]
+
+
+# Глобальные хранилища данных (потокобезопасные, с ограничением размера)
+last_images = SafeStore(maxsize=30)       # BytesIO последних картинок (тяжёлые — держим немного)
+last_message_ids = SafeStore()
+last_seeds = SafeStore()
+last_configs = SafeStore()
+temp_data = SafeStore()
+pagination_data = SafeStore()
+preview_messages = SafeStore()  # user_id -> message_id сообщения с превью
 
 ITEMS_PER_PAGE = 20
 
@@ -184,6 +240,191 @@ def update_status_message(message_id, chat_id, status_text):
     except:
         pass
 
+# =========== ОБЩИЕ ХЕЛПЕРЫ ===========
+
+def _h(value):
+    """Экранирует текст для parse_mode="HTML" (промпты пользователей могут содержать <, >, &, `, _, *)."""
+    return html.escape(str(value), quote=False)
+
+def _cut(text, limit):
+    text = str(text)
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+def _text(message):
+    """Текст сообщения или пустая строка (фото, стикер и т.п. раньше роняли обработчики на None.strip())."""
+    return (getattr(message, "text", None) or "").strip()
+
+def _safe_answer(call, text=None, show_alert=False):
+    """answer_callback_query, который не падает: на один callback можно ответить только один раз и недолго."""
+    try:
+        bot.answer_callback_query(call.id, text, show_alert=show_alert)
+    except Exception:
+        pass
+
+def _report_error(chat_id, status_message_id, error):
+    """Показывает ошибку на месте статус-сообщения (или новым сообщением, если его нельзя изменить)."""
+    text = _cut(f"❌ Ошибка: {error}", 3900)
+    try:
+        bot.edit_message_text(text, chat_id, status_message_id)
+    except Exception:
+        try:
+            bot.send_message(chat_id, text)
+        except Exception as send_error:
+            print(f"⚠️ Не удалось сообщить об ошибке пользователю: {send_error}")
+
+def _is_cancel_text(text):
+    """Кнопка меню или команда вместо ожидаемого текста — отмена текущего шага."""
+    return (not text) or text in BUTTON_TEXTS or text.startswith('/')
+
+# --- Отправка изображений: фото или файл ---------------------------------------------------------
+# Telegram принимает как «фото» только файлы до 10 МБ, с суммой сторон не более 10000 px и
+# соотношением сторон не более 20:1; при этом фото ещё и пережимается. Всё, что не проходит,
+# отправляется документом (файлом) без потери качества — раньше такая отправка падала с ошибкой,
+# и готовая (часто апскейленная) картинка пропадала.
+TG_PHOTO_MAX_BYTES = 10 * 1024 * 1024 - 64 * 1024
+TG_PHOTO_MAX_SUM_SIDES = 10000
+TG_PHOTO_MAX_RATIO = 20
+TG_DOCUMENT_MAX_BYTES = 49 * 1024 * 1024
+TG_CAPTION_LIMIT = 1024
+TG_MESSAGE_LIMIT = 4096
+# Размер вплоть до которого фото отправляется «как фото» можно занизить, чтобы большие картинки
+# уходили без пережатия: переменная окружения SEND_AS_FILE_ABOVE_MB (по умолчанию — лимит Telegram).
+try:
+    _SEND_AS_FILE_ABOVE = min(TG_PHOTO_MAX_BYTES, int(float(os.environ.get("SEND_AS_FILE_ABOVE_MB", "0")) * 1024 * 1024)) or TG_PHOTO_MAX_BYTES
+except ValueError:
+    _SEND_AS_FILE_ABOVE = TG_PHOTO_MAX_BYTES
+
+def _image_bytes(image):
+    if isinstance(image, (bytes, bytearray)):
+        return bytes(image)
+    if hasattr(image, "getvalue"):
+        return image.getvalue()
+    image.seek(0)
+    return image.read()
+
+def _image_info(data):
+    """(ширина, высота, формат) либо (0, 0, None), если PIL не смог прочитать."""
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            return img.width, img.height, (img.format or "").upper()
+    except Exception:
+        return 0, 0, None
+
+def _photo_limit_reason(data, width, height):
+    """Почему изображение нельзя отправить фото (None — можно)."""
+    if len(data) > _SEND_AS_FILE_ABOVE:
+        return f"вес {len(data) / 1024 / 1024:.1f} МБ"
+    if width and height:
+        if width + height > TG_PHOTO_MAX_SUM_SIDES:
+            return f"разрешение {width}×{height}"
+        if max(width, height) / max(1, min(width, height)) > TG_PHOTO_MAX_RATIO:
+            return f"пропорции {width}×{height}"
+    return None
+
+def _shrink_for_document(data):
+    """Если файл больше лимита Telegram на документы (50 МБ) — пересохраняет в JPEG, при необходимости уменьшая."""
+    if len(data) <= TG_DOCUMENT_MAX_BYTES:
+        return data, None
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            rgb = img.convert("RGB")
+        for scale in (1.0, 0.75, 0.5, 0.35):
+            candidate = rgb if scale == 1.0 else rgb.resize((max(1, int(rgb.width * scale)), max(1, int(rgb.height * scale))), Image.LANCZOS)
+            for quality in (95, 88, 80):
+                buf = io.BytesIO()
+                candidate.save(buf, format="JPEG", quality=quality)
+                if buf.tell() <= TG_DOCUMENT_MAX_BYTES:
+                    return buf.getvalue(), "jpg"
+    except Exception as e:
+        print(f"⚠️ Не удалось уменьшить файл: {e}")
+    return data, None
+
+def _is_parse_error(error):
+    return "can't parse entities" in str(error).lower()
+
+def _is_photo_rejected(error):
+    text = str(error).lower()
+    return any(marker in text for marker in (
+        "photo_invalid_dimensions", "photo_save_file_invalid", "image_process_failed",
+        "wrong file identifier", "file is too big", "wrong type of the web page content",
+        "failed to get http url content", "request entity too large", "photo_ext_invalid",
+    ))
+
+def send_image_smart(chat_id, image, caption=None, parse_mode=None, reply_to_message_id=None,
+                     reply_markup=None, filename=None, force_document=False):
+    """
+    Отправляет картинку как фото, а если она не подходит под лимиты Telegram по весу/разрешению/пропорциям
+    (или фото отклонено сервером) — как файл. Возвращает объект отправленного сообщения.
+
+    * подпись длиннее 1024 символов уходит отдельным сообщением (иначе Telegram отклонял всю отправку);
+    * если в подписи оказалась некорректная разметка — повторяет отправку обычным текстом.
+    """
+    data = _image_bytes(image)
+    if not data:
+        raise Exception("Пустое изображение — нечего отправлять")
+    width, height, fmt = _image_info(data)
+    reason = "по запросу" if force_document else _photo_limit_reason(data, width, height)
+    as_document = bool(reason)
+    ext = {"JPEG": "jpg", "PNG": "png", "WEBP": "webp", "GIF": "gif"}.get(fmt, "png")
+
+    def make_caption(is_document):
+        text = caption or ""
+        if is_document and reason and reason != "по запросу":
+            text += f"\n📎 Отправлено файлом без сжатия ({reason})"
+        return text
+
+    def send(is_document):
+        payload = data
+        out_ext = ext
+        if is_document:
+            payload, new_ext = _shrink_for_document(payload)
+            out_ext = new_ext or ext
+        text = make_caption(is_document)
+        separate_text = None
+        if len(text) > TG_CAPTION_LIMIT:
+            separate_text, text = text, None
+        buf = io.BytesIO(payload)
+        buf.name = filename or (f"image_{width}x{height}.{out_ext}" if is_document and width else f"image.{out_ext}")
+        kwargs = dict(reply_to_message_id=reply_to_message_id, reply_markup=reply_markup)
+        if text:
+            kwargs.update(caption=text, parse_mode=parse_mode)
+        try:
+            if is_document:
+                sent = bot.send_document(chat_id, buf, **kwargs)
+            else:
+                sent = bot.send_photo(chat_id, buf, **kwargs)
+        except Exception as e:
+            if text and parse_mode and _is_parse_error(e):
+                kwargs.pop("parse_mode", None)
+                kwargs["caption"] = re.sub(r"<[^>]+>", "", html.unescape(text)) if parse_mode == "HTML" else text
+                buf.seek(0)
+                sent = bot.send_document(chat_id, buf, **kwargs) if is_document else bot.send_photo(chat_id, buf, **kwargs)
+            else:
+                raise
+        if separate_text:
+            body = _cut(separate_text, TG_MESSAGE_LIMIT)
+            try:
+                bot.send_message(chat_id, body, parse_mode=parse_mode, reply_to_message_id=sent.message_id)
+            except Exception as e:
+                if _is_parse_error(e):
+                    plain = re.sub(r"<[^>]+>", "", html.unescape(body)) if parse_mode == "HTML" else body
+                    bot.send_message(chat_id, plain, reply_to_message_id=sent.message_id)
+                else:
+                    print(f"⚠️ Не удалось отправить подпись отдельным сообщением: {e}")
+        return sent
+
+    if as_document:
+        print(f"📎 Отправляю файлом ({reason})")
+        return send(True)
+    try:
+        return send(False)
+    except Exception as e:
+        if _is_photo_rejected(e):
+            print(f"📎 Telegram отклонил фото ({e}); отправляю файлом")
+            reason = "Telegram не принял как фото"
+            return send(True)
+        raise
+
 # =========== КЛАВИАТУРЫ ===========
 
 def get_main_keyboard():
@@ -203,7 +444,8 @@ def get_settings_inline_keyboard(settings, user_id):
     btn_res = types.InlineKeyboardButton(f"📐 Размер: {settings['width']}x{settings['height']}", callback_data="set_res")
     btn_steps = types.InlineKeyboardButton(f"⏱️ Шаги: {settings['steps']}", callback_data="set_steps")
     btn_cfg = types.InlineKeyboardButton(f"🎚️ CFG: {settings['cfg_scale']}", callback_data="set_cfg")
-    btn_neg = types.InlineKeyboardButton(f"🚫 Негативный промпт", callback_data="set_neg")
+    emb_count = len(get_user_negative_embeddings(user_id))
+    btn_neg = types.InlineKeyboardButton(f"🚫 Негатив" + (f" (🧬{emb_count})" if emb_count else ""), callback_data="set_neg")
     btn_sampler = types.InlineKeyboardButton(f"🎯 Сэмплер: {settings.get('sampler_name', 'DPM++ 2M')}", callback_data="set_sampler")  # <--- НОВАЯ КНОПКА
     diversity_mode = get_diversity_mode(user_id)
     diversity_text = {
@@ -217,9 +459,6 @@ def get_settings_inline_keyboard(settings, user_id):
     prompt_text = "🤖 Обработка: ✅ Вкл" if prompt_processing else "🤖 Обработка: ❌ Выкл"
     btn_prompt = types.InlineKeyboardButton(prompt_text, callback_data="toggle_prompt_processing")
     btn_lora = types.InlineKeyboardButton("🎛️ LoRA", callback_data="manage_lora")
-    neg_embeddings_count = len(get_user_negative_embeddings(user_id))
-    emb_label = f"🧨 Негативные эмбеддинги{f': {neg_embeddings_count} ✅' if neg_embeddings_count else ''}"
-    btn_embeddings = types.InlineKeyboardButton(emb_label, callback_data="manage_neg_embeddings")
     model_label = _model_display_name(user_id)
     if len(model_label) > 30:
         model_label = model_label[:29] + "…"
@@ -230,7 +469,6 @@ def get_settings_inline_keyboard(settings, user_id):
     markup.add(btn_sampler, btn_neg)  # <--- Добавляем кнопку сэмплера
     markup.add(btn_diversity, btn_prompt)
     markup.add(btn_lora)
-    markup.add(btn_embeddings)
     return markup
 
 def get_resolution_keyboard(current_width, current_height):
@@ -648,9 +886,7 @@ def handle_controlnet_use(call):
         return
     source = filtered[idx]
     # Сохраняем выбранный источник
-    if user_id not in temp_data:
-        temp_data[user_id] = {}
-    temp_data[user_id]['controlnet_source'] = {
+    temp_data.setdefault(user_id, {})['controlnet_source'] = {
         'type': source['type'],
         'file': source.get('file'),
         'index': source.get('index'),
@@ -704,12 +940,9 @@ def process_controlnet_prompt(message, user_id, source=None):
     Обрабатывает промпт для ControlNet.
     source может быть передан при первом выборе, либо взят из temp_data при повторной генерации.
     """
-    if message.text in BUTTON_TEXTS or message.text.startswith('/'):
-        bot.send_message(message.chat.id, "❌ Это кнопка или команда. Отправьте текстовый промпт.")
-        return
-    prompt = message.text.strip()
-    if not prompt:
-        bot.send_message(message.chat.id, "❌ Промпт не может быть пустым.")
+    prompt = _text(message)
+    if _is_cancel_text(prompt):
+        bot.send_message(message.chat.id, "❌ Нужен текстовый промпт (не кнопка, команда или файл). Отменено.")
         return
     
     # Если source не передан, берём из temp_data (для повторной генерации)
@@ -734,12 +967,10 @@ def process_controlnet_prompt(message, user_id, source=None):
             return
         source = target
         # также обновим данные в temp_data, чтобы сохранить актуальный full_label
-        temp_data[user_id]['controlnet_source']['full_label'] = source.get('full_label', source['label'])
+        data['full_label'] = source.get('full_label', source['label'])
     else:
         # Если source передан, сохраняем его в temp_data (если ещё не сохранён)
-        if user_id not in temp_data:
-            temp_data[user_id] = {}
-        temp_data[user_id]['controlnet_source'] = {
+        temp_data.setdefault(user_id, {})['controlnet_source'] = {
             'type': source['type'],
             'file': source.get('file'),
             'index': source.get('index'),
@@ -823,18 +1054,18 @@ def process_controlnet_prompt(message, user_id, source=None):
         
         # Формируем капшн с полной информацией
         caption = (
-            f"✅ **ControlNet генерация**\n"
-            f"🦴 Скелет: `{source.get('full_label', source['label'])}`\n"
-            f"✨ **Исходный промпт:**\n`{original_prompt}`\n\n"
-            f"🤖 **Обработанный промпт:**\n`{processed_prompt}`\n\n"
-            f"📐 **Размер:** {settings.get('width', 512)}x{settings.get('height', 768)}\n"
-            f"⏱️ **Шаги:** {settings.get('steps', 20)}\n"
-            f"🎚️ **CFG:** {settings.get('cfg_scale', 7.0)}\n"
-            f"🎲 **Seed:** `{generated_image.seed if hasattr(generated_image, 'seed') else 'N/A'}`\n"
+            f"✅ <b>ControlNet генерация</b>\n"
+            f"🦴 Скелет: <code>{_h(source.get('full_label', source['label']))}</code>\n"
+            f"✨ <b>Исходный промпт:</b>\n<code>{_h(_cut(original_prompt, 600))}</code>\n\n"
+            f"🤖 <b>Обработанный промпт:</b>\n<code>{_h(_cut(processed_prompt, 1000))}</code>\n\n"
+            f"📐 <b>Размер:</b> {settings.get('width', 512)}x{settings.get('height', 768)}\n"
+            f"⏱️ <b>Шаги:</b> {settings.get('steps', 20)}\n"
+            f"🎚️ <b>CFG:</b> {settings.get('cfg_scale', 7.0)}\n"
+            f"🎲 <b>Seed:</b> <code>{getattr(generated_image, 'seed', 'N/A')}</code>\n"
         )
         if face_replaced:
-            caption += "🎭 **Лицо заменено**\n"
-        sent_msg = bot.send_photo(message.chat.id, final_image, caption=caption, parse_mode="Markdown")
+            caption += "🎭 <b>Лицо заменено</b>\n"
+        sent_msg = send_image_smart(message.chat.id, final_image, caption=caption, parse_mode="HTML")
         last_images[user_id] = final_image
         last_message_ids[user_id] = sent_msg.message_id
         # Сохраняем конфигурацию для повтора
@@ -842,8 +1073,8 @@ def process_controlnet_prompt(message, user_id, source=None):
             "type": "controlnet",
             "prompt": processed_prompt,
             "original_prompt": original_prompt,
-            "settings": settings,
-            "seed": 0,  # seed не сохраняется отдельно, можно взять из ответа
+            "settings": dict(settings),
+            "seed": getattr(generated_image, "seed", 0),
             "face_enabled": face_replaced,
             "controlnet_source": {
                 'type': source['type'],
@@ -868,7 +1099,7 @@ def process_controlnet_prompt(message, user_id, source=None):
         bot.send_message(message.chat.id, "🔧 **Действия с изображением:**", reply_markup=get_controlnet_actions_keyboard())
     except Exception as e:
         prompt_logger.log_error(gen_id, user_id, "controlnet", prompt, e, duration_sec=time.time() - start_time)
-        bot.edit_message_text(f"❌ Ошибка: {str(e)}", message.chat.id, status_msg.message_id)
+        _report_error(message.chat.id, status_msg.message_id, e)
     finally:
         # Не удаляем controlnet_source, чтобы можно было повторно использовать (если не было ошибки)
         # Но если мы хотим, чтобы при повторном выборе скелета он перезаписывался, то оставляем.
@@ -879,37 +1110,28 @@ def process_controlnet_prompt(message, user_id, source=None):
 def show_samplers(message):
     """Показывает список доступных сэмплеров"""
     try:
-        from settings import get_available_samplers
         samplers = get_available_samplers()
-        
         if not samplers:
             bot.reply_to(message, "❌ Не удалось получить список сэмплеров")
             return
-        
-        # Форматируем список для красивого вывода
-        samplers_text = "\n".join([f"• `{s}`" for s in samplers])
-        
-        # Получаем текущий сэмплер пользователя
-        from settings import get_user_sampler
+
         user_id = str(message.chat.id)
         current = get_user_sampler(user_id)
-        
-        # Добавляем отметку текущего сэмплера
-        current_marker = f"⭐ **Текущий сэмплер:** `{current}`\n\n"
-        
-        # Разбиваем на части если слишком длинный
-        full_text = f"{current_master}**Доступные сэмплеры:**\n{samplers_text}"
-        
-        if len(full_text) > 4000:
-            parts = [full_text[i:i+4000] for i in range(0, len(full_text), 4000)]
-            for i, part in enumerate(parts):
-                if i == 0:
-                    bot.send_message(message.chat.id, part, parse_mode="Markdown")
-                else:
-                    bot.send_message(message.chat.id, part, parse_mode="Markdown")
-        else:
-            bot.send_message(message.chat.id, full_text, parse_mode="Markdown")
-            
+
+        # Раньше здесь была опечатка (current_master вместо current_marker) — команда всегда падала с NameError.
+        header = f"⭐ <b>Текущий сэмплер:</b> <code>{_h(current)}</code>\n\n<b>Доступные сэмплеры:</b>\n"
+        lines = [f"• <code>{_h(s)}</code>" for s in samplers]
+
+        # Режем по границам строк, чтобы не разрывать HTML-теги посреди сообщения
+        chunks, chunk = [], header
+        for line in lines:
+            if len(chunk) + len(line) + 1 > 3900:
+                chunks.append(chunk)
+                chunk = ""
+            chunk += line + "\n"
+        chunks.append(chunk)
+        for part in chunks:
+            bot.send_message(message.chat.id, part, parse_mode="HTML")
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка: {e}")
 
@@ -917,65 +1139,57 @@ def show_samplers(message):
 def set_sampler_command(message):
     """Устанавливает сэмплер для пользователя"""
     user_id = str(message.chat.id)
-    
+
     # Разбираем команду
-    parts = message.text.split(maxsplit=1)
+    parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        # Показываем текущий сэмплер
-        from settings import get_user_sampler, get_available_samplers
+        # Показываем текущий сэмплер (подсказки раньше ссылались на несуществующие команды «!samplers»)
         current = get_user_sampler(user_id)
-        samplers = get_available_samplers()
         bot.reply_to(
             message,
-            f"📌 **Текущий сэмплер:** `{current}`\n\n"
-            f"📋 **Используйте** `!setsampler <название>` для смены\n"
-            f"🔍 **Просмотр всех:** `!samplers`\n\n"
-            f"Пример: `!setsampler DPM++ 2M Karras`"
+            f"📌 <b>Текущий сэмплер:</b> <code>{_h(current)}</code>\n\n"
+            f"📋 Используйте <code>/setsampler &lt;название&gt;</code> для смены\n"
+            f"🔍 Просмотр всех: /samplers\n\n"
+            f"Пример: <code>/setsampler DPM++ 2M Karras</code>",
+            parse_mode="HTML"
         )
         return
-    
+
     sampler_name = parts[1].strip()
-    
+
     try:
-        from settings import get_available_samplers, set_user_sampler, get_user_sampler
-        
         # Проверяем, существует ли такой сэмплер
         samplers = get_available_samplers()
         if not samplers:
             bot.reply_to(message, "❌ Не удалось получить список сэмплеров")
             return
-        
-        # Ищем точное совпадение или частичное
-        if sampler_name in samplers:
-            # Точное совпадение
-            set_user_sampler(user_id, sampler_name)
-            bot.reply_to(message, f"✅ **Сэмплер изменён:** `{sampler_name}`")
+
+        # Ищем точное совпадение (без учёта регистра), затем частичное
+        exact = [s for s in samplers if s.lower() == sampler_name.lower()]
+        matching = exact or [s for s in samplers if sampler_name.lower() in s.lower()]
+
+        if len(matching) == 1:
+            set_user_sampler(user_id, matching[0])
+            bot.reply_to(message, f"✅ <b>Сэмплер изменён:</b> <code>{_h(matching[0])}</code>", parse_mode="HTML")
+        elif len(matching) > 1:
+            suggestions = "\n".join([f"• <code>{_h(s)}</code>" for s in matching[:10]])
+            bot.reply_to(
+                message,
+                f"❓ <b>Найдено несколько сэмплеров:</b>\n{suggestions}\n\n"
+                f"Уточните название. Все доступные: /samplers",
+                parse_mode="HTML"
+            )
         else:
-            # Ищем частичное совпадение (регистронезависимо)
-            matching = [s for s in samplers if sampler_name.lower() in s.lower()]
-            
-            if len(matching) == 1:
-                # Найдено одно совпадение - устанавливаем
-                set_user_sampler(user_id, matching[0])
-                bot.reply_to(message, f"✅ **Сэмплер изменён:** `{matching[0]}`")
-            elif len(matching) > 1:
-                # Несколько совпадений - предлагаем выбрать
-                suggestions = "\n".join([f"• `{s}`" for s in matching[:10]])
-                bot.reply_to(
-                    message,
-                    f"❓ **Найдено несколько сэмплеров:**\n{suggestions}\n\n"
-                    f"Уточните название. Используйте `!samplers` для просмотра всех."
-                )
-            else:
-                # Нет совпадений
-                bot.reply_to(
-                    message,
-                    f"❌ **Сэмплер не найден:** `{sampler_name}`\n\n"
-                    f"Используйте `!samplers` для просмотра всех доступных."
-                )
-                
+            bot.reply_to(
+                message,
+                f"❌ <b>Сэмплер не найден:</b> <code>{_h(sampler_name)}</code>\n\n"
+                f"Все доступные: /samplers",
+                parse_mode="HTML"
+            )
+
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка: {e}")
+
 # =========== ОБРАБОТЧИК "ТОТ ЖЕ СКЕЛЕТ" ===========
 
 @bot.callback_query_handler(func=lambda call: call.data == "action_same_skeleton")
@@ -1005,9 +1219,7 @@ def handle_same_skeleton(call):
         bot.answer_callback_query(call.id, "❌ Скелет не найден (возможно, файл удалён).", show_alert=True)
         return
     # Сохраняем скелет в temp_data для process_controlnet_prompt
-    if user_id not in temp_data:
-        temp_data[user_id] = {}
-    temp_data[user_id]['controlnet_source'] = {
+    temp_data.setdefault(user_id, {})['controlnet_source'] = {
         'type': target['type'],
         'file': target.get('file'),
         'index': target.get('index'),
@@ -1046,7 +1258,10 @@ def extended_generation_start(message):
 def show_settings(message):
     user_id = str(message.chat.id)
     settings = get_user_settings(user_id)
-    current_neg = get_user_negative_prompt(user_id)
+    current_neg = get_user_negative_prompt(user_id).replace("`", "'")
+    neg_preview = current_neg if len(current_neg) <= 80 else current_neg[:80] + "…"
+    emb_names = get_user_negative_embeddings(user_id)
+    emb_line = f"\n🧬 **Эмбеддинги:** `{_cut(', '.join(emb_names), 150).replace(chr(96), chr(39))}`" if emb_names else ""
     prompt_processing = get_prompt_processing_enabled(user_id)
     text = (
         "🎛️ **Текущие настройки:**\n\n"
@@ -1056,7 +1271,7 @@ def show_settings(message):
         f"🎯 Сэмплер: {settings.get('sampler_name', 'DPM++ 2M')}\n"  # <--- Добавлена строка
         f"🧩 Модель: `{_model_display_name(user_id).replace('`', '')}`\n"
         f"🤖 **Обработка промпта:** {'✅ Включена' if prompt_processing else '❌ Выключена'}\n\n"
-        f"🚫 **Негативный промпт:**\n`{current_neg[:80]}...`"
+        f"🚫 **Негативный промпт:**\n`{neg_preview}`{emb_line}"
     )
     bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=get_settings_inline_keyboard(settings, user_id))
 
@@ -1254,12 +1469,10 @@ def handle_model_default(call):
 MAX_UPSCALE_SIDE = 8192              # максимальная сторона результата, px (защита от нехватки памяти)
 MAX_RESULT_FILE_BYTES = 45 * 1024 * 1024   # лимит Telegram для отправки ботом — 50 МБ
 PENDING_UPSCALE_LIMIT = 30
-pending_upscale = {}                 # (chat_id, id сообщения с кнопками) -> байты исходного изображения
+pending_upscale = SafeStore(maxsize=PENDING_UPSCALE_LIMIT)  # (chat_id, id сообщения с кнопками) -> байты исходного изображения
 
 def _remember_pending_upscale(key, data):
-    pending_upscale[key] = data
-    while len(pending_upscale) > PENDING_UPSCALE_LIMIT:
-        pending_upscale.pop(next(iter(pending_upscale)))   # выбрасываем самое старое
+    pending_upscale[key] = data   # SafeStore потокобезопасен и сам вытесняет самые старые записи
 
 def _offer_photo_upscale(message, file_id):
     """Скачивает присланное изображение и предлагает выбрать коэффициент увеличения."""
@@ -1358,7 +1571,7 @@ def handle_photo_upscale_callback(call):
 @bot.message_handler(func=lambda message: True, content_types=['text'])
 def handle_quick_generation(message):
     # Игнорируем команды, ответы, кнопки и слишком короткие сообщения
-    if message.text.startswith('/'):
+    if not message.text or message.text.startswith('/'):
         return
     if message.reply_to_message:
         return
@@ -1411,28 +1624,28 @@ def handle_quick_generation(message):
         except:
             pass
         caption = (
-            f"✨ **Исходный промпт:**\n`{original_prompt}`\n\n"
-            f"🤖 **Обработанный промпт:**\n`{processed_prompt}`\n\n"
-            f"📐 **Размер:** {settings.get('width', 512)}x{settings.get('height', 768)}\n"
-            f"⏱️ **Шаги:** {settings.get('steps', 20)}\n"
-            f"🎚️ **CFG:** {settings.get('cfg_scale', 7.0)}\n"
-            f"🎯 **Сэмплер:** `{settings.get('sampler_name')}`\n"  # <--- Добавлена строка с сэмплером
-            f"🎲 **Seed:** `{used_seed}`\n"
+            f"✨ <b>Исходный промпт:</b>\n<code>{_h(_cut(original_prompt, 700))}</code>\n\n"
+            f"🤖 <b>Обработанный промпт:</b>\n<code>{_h(_cut(processed_prompt, 1200))}</code>\n\n"
+            f"📐 <b>Размер:</b> {settings.get('width', 512)}x{settings.get('height', 768)}\n"
+            f"⏱️ <b>Шаги:</b> {settings.get('steps', 20)}\n"
+            f"🎚️ <b>CFG:</b> {settings.get('cfg_scale', 7.0)}\n"
+            f"🎯 <b>Сэмплер:</b> <code>{_h(settings.get('sampler_name'))}</code>\n"
+            f"🎲 <b>Seed:</b> <code>{used_seed}</code>\n"
         )
         if face_replacement_success:
-            caption += "🎭 **Лицо заменено**\n"
-        sent_msg = bot.send_photo(message.chat.id, final_image_file, reply_to_message_id=message.id, caption=caption, parse_mode="Markdown")
+            caption += "🎭 <b>Лицо заменено</b>\n"
+        # Фото либо файл (если не проходит по весу/разрешению), подпись длиннее 1024 — отдельным сообщением
+        sent_msg = send_image_smart(message.chat.id, final_image_file, caption=caption, parse_mode="HTML",
+                                    reply_to_message_id=message.id)
+        # В конфиг пишем ПОЛНУЮ копию настроек (с моделью, сэмплером и т.д.) и итоговые промпты, ушедшие в WebUI:
+        # по ним «Повторить» воспроизводит ту же картинку (раньше терялись сэмплер и модель, а промпт обрабатывался заново)
         config = {
             "type": "txt2img",
             "prompt": processed_prompt,
             "original_prompt": original_prompt,
-            "settings": {
-                "width": settings.get("width", 512),
-                "height": settings.get("height", 768),
-                "steps": settings.get("steps", 20),
-                "cfg_scale": settings.get("cfg_scale", 7.0),
-                "sampler": settings.get("sampler_name", "DPM++ 2M")
-            },
+            "final_prompt": getattr(image_file, "final_prompt", None),
+            "final_negative": getattr(image_file, "final_negative", None),
+            "settings": dict(settings),
             "seed": used_seed,
             "face_enabled": face_replacement_success
         }
@@ -1450,10 +1663,7 @@ def handle_quick_generation(message):
         bot.send_message(message.chat.id, "🔧 **Действия с изображением:**", reply_markup=get_image_actions_keyboard(), reply_to_message_id=sent_msg.message_id)
     except Exception as e:
         prompt_logger.log_error(gen_id, user_id, "txt2img", prompt, e, duration_sec=time.time() - start_time)
-        try:
-            bot.edit_message_text(f"❌ Ошибка: {str(e)}", message.chat.id, status_msg.message_id)
-        except:
-            bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)}")
+        _report_error(message.chat.id, status_msg.message_id, e)
 
 # =========== ОСТАЛЬНЫЕ ОБРАБОТЧИКИ (ЛИЦА, НАСТРОЙКИ, АПСКЕЙЛ и т.д.) ===========
 
@@ -1474,17 +1684,28 @@ def handle_face_add(call):
 
 def save_new_face(message, original_chat_id):
     user_id = str(message.chat.id)
-    if not message.photo:
+    # Принимаем и обычное фото, и изображение, отправленное «как файл» (без сжатия — для лица это лучше)
+    document = getattr(message, "document", None)
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif document and (getattr(document, "mime_type", None) or "").startswith("image/"):
+        file_id = document.file_id
+    else:
         bot.send_message(message.chat.id, "❌ Пожалуйста, отправьте фото.")
         return
     try:
-        photo = message.photo[-1]
-        file_info = bot.get_file(photo.file_id)
+        file_info = bot.get_file(file_id)
         downloaded_file = bot.download_file(file_info.file_path)
-        temp_face = io.BytesIO(downloaded_file)
-        if user_id not in temp_data:
-            temp_data[user_id] = {}
-        temp_data[user_id]['temp_face'] = temp_face
+        # Лица хранятся как JPEG: приводим формат к единому и заодно проверяем, что это действительно картинка
+        try:
+            with Image.open(io.BytesIO(downloaded_file)) as face_img:
+                converted = io.BytesIO()
+                face_img.convert("RGB").save(converted, format="JPEG", quality=95)
+        except Exception:
+            bot.send_message(message.chat.id, "❌ Не удалось прочитать изображение. Отправьте фото в формате JPG/PNG.")
+            return
+        temp_face = io.BytesIO(converted.getvalue())
+        temp_data.setdefault(user_id, {})['temp_face'] = temp_face
         msg = bot.send_message(message.chat.id, "✏️ **Введите имя для этого лица**\n\nНапример: 'я', 'друг', 'коллега' и т.д.\n\nИли отправьте 'default' для стандартного имени.", parse_mode="Markdown")
         bot.register_next_step_handler(msg, set_face_name, original_chat_id)
     except Exception as e:
@@ -1504,16 +1725,17 @@ def set_face_name(message, original_chat_id):
         msg = bot.send_message(message.chat.id, f"❌ Лицо с именем '{face_name}' уже существует. Введите другое имя:")
         bot.register_next_step_handler(msg, set_face_name, original_chat_id)
         return
-    if user_id in temp_data and 'temp_face' in temp_data[user_id]:
-        success = save_user_face(user_id, temp_data[user_id]['temp_face'], face_name)
+    temp_face = temp_data.get(user_id, {}).get('temp_face')
+    if temp_face is not None:
+        success = save_user_face(user_id, temp_face, face_name)
         if success:
-            bot.send_message(message.chat.id, f"✅ **Лицо '{face_name}' успешно сохранено!**\n\nТеперь вы можете выбрать его как активное в меню управления лицами.", parse_mode="Markdown")
+            bot.send_message(message.chat.id, f"✅ <b>Лицо '{_h(face_name)}' успешно сохранено!</b>\n\nТеперь вы можете выбрать его как активное в меню управления лицами.", parse_mode="HTML")
             preview = get_face_preview(user_id, face_name)
             if preview:
                 bot.send_photo(message.chat.id, preview, caption=f"📸 {face_name}")
         else:
             bot.send_message(message.chat.id, "❌ Ошибка при сохранении лица.")
-        del temp_data[user_id]['temp_face']
+        temp_data.get(user_id, {}).pop('temp_face', None)
     else:
         bot.send_message(message.chat.id, "❌ Ошибка: фото не найдено.")
 
@@ -1700,12 +1922,18 @@ def handle_diversity(call):
     settings = get_user_settings(user_id)
     modes = ["auto", "high", "low", "off"]
     current = settings.get("diversity_mode", "auto")
+    if current not in modes:
+        current = "auto"
     next_index = (modes.index(current) + 1) % len(modes)
     new_mode = modes[next_index]
     set_diversity_mode(user_id, new_mode)
     settings = get_user_settings(user_id)
-    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=get_settings_inline_keyboard(settings, user_id))
-    bot.answer_callback_query(call.id, f"Разнообразие: {new_mode}")
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=get_settings_inline_keyboard(settings, user_id))
+    except Exception as e:
+        if "message is not modified" not in str(e):
+            raise
+    _safe_answer(call, f"Разнообразие: {new_mode}")
 
 @bot.callback_query_handler(func=lambda call: call.data == "set_res")
 def handle_resolution_button(call):
@@ -1719,10 +1947,7 @@ def handle_resolution_choice(call):
     user_id = str(call.message.chat.id)
     _, w, h = call.data.split("_")
     w, h = int(w), int(h)
-    settings = get_user_settings(user_id)
-    settings["width"] = w
-    settings["height"] = h
-    save_user_settings(user_id, settings)
+    update_user_settings(user_id, {"width": w, "height": h})
     bot.answer_callback_query(call.id, f"Размер установлен: {w}x{h}")
     show_settings(call.message)
 
@@ -1737,9 +1962,7 @@ def handle_cfg_button(call):
 def handle_cfg_choice(call):
     user_id = str(call.message.chat.id)
     cfg = float(call.data.split("_")[1])
-    settings = get_user_settings(user_id)
-    settings["cfg_scale"] = cfg
-    save_user_settings(user_id, settings)
+    update_user_settings(user_id, {"cfg_scale": cfg})
     bot.answer_callback_query(call.id, f"CFG установлен: {cfg}")
     show_settings(call.message)
 
@@ -1754,50 +1977,210 @@ def handle_steps_button(call):
 def handle_steps_choice(call):
     user_id = str(call.message.chat.id)
     steps = int(call.data.split("_")[1])
-    settings = get_user_settings(user_id)
-    settings["steps"] = steps
-    save_user_settings(user_id, settings)
+    update_user_settings(user_id, {"steps": steps})
     bot.answer_callback_query(call.id, f"Шагов: {steps}")
     show_settings(call.message)
 
+# =========== НЕГАТИВНЫЙ ПРОМПТ И НЕГАТИВНЫЕ ЭМБЕДДИНГИ ===========
+
+EMBEDDINGS_PER_PAGE = 10
+
+def _emb_id(name):
+    return hashlib.md5(name.encode("utf-8")).hexdigest()[:10]
+
+def _edit_or_send(chat_id, message_id, text, markup):
+    """Редактирует сообщение меню (если можно), иначе отправляет новое."""
+    if message_id is not None:
+        try:
+            bot.edit_message_text(text, chat_id, message_id, parse_mode="HTML", reply_markup=markup)
+            return
+        except Exception as e:
+            if "message is not modified" in str(e):
+                return
+    bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+
+def _show_negative_menu(chat_id, user_id, message_id=None):
+    negative = get_user_negative_prompt(user_id)
+    is_default = negative == DEFAULT_NEGATIVE_PROMPT
+    embeddings = get_user_negative_embeddings(user_id)
+    text = (
+        "🚫 <b>Негативный промпт</b>\n\n"
+        f"<b>Текст{' (стандартный)' if is_default else ''}:</b>\n<code>{_h(_cut(negative, 400))}</code>\n\n"
+        f"🧬 <b>Эмбеддинги:</b> {_h(_cut(', '.join(embeddings), 400)) if embeddings else 'не выбраны'}\n\n"
+        "Эмбеддинги берутся из WebUI и добавляются в негативный промпт при каждой генерации."
+    )
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("✏️ Изменить текст", callback_data="neg_text"),
+        types.InlineKeyboardButton(f"🧬 Эмбеддинги ({len(embeddings)})", callback_data="neg_emb"),
+    )
+    if not is_default:
+        markup.add(types.InlineKeyboardButton("↩️ Сбросить текст на стандартный", callback_data="neg_reset"))
+    markup.add(types.InlineKeyboardButton("◀️ Назад", callback_data="back_to_settings"))
+    _edit_or_send(chat_id, message_id, text, markup)
+
 @bot.callback_query_handler(func=lambda call: call.data == "set_neg")
 def handle_neg_button(call):
-    bot.answer_callback_query(call.id)
-    msg = bot.send_message(call.message.chat.id, "✏️ Отправь свой негативный промпт\n\nИли отправь `сбросить` для стандартного", parse_mode="Markdown")
+    _safe_answer(call)
+    _show_negative_menu(call.message.chat.id, str(call.message.chat.id), call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "neg_text")
+def handle_neg_text_button(call):
+    _safe_answer(call)
+    msg = bot.send_message(call.message.chat.id, "✏️ Отправь свой негативный промпт\n\nИли отправь <code>сбросить</code> для стандартного", parse_mode="HTML")
     bot.register_next_step_handler(msg, save_custom_negative, call.message.chat.id, call.message.message_id)
 
 def save_custom_negative(message, chat_id, original_msg_id):
     user_id = str(message.chat.id)
-    new_neg = message.text.strip()
+    new_neg = _text(message)
+    if not new_neg or new_neg.startswith('/') or new_neg in BUTTON_TEXTS:
+        # Фото, стикер, команда или кнопка вместо текста раньше сохранялись/роняли обработчик
+        bot.send_message(chat_id, "❌ Отменено: нужен текст негативного промпта.")
+        return
     if new_neg.lower() == "сбросить":
         set_user_negative_prompt(user_id, None)
         bot.send_message(chat_id, "✅ Сброшено до стандартного!")
     else:
         set_user_negative_prompt(user_id, new_neg)
-        bot.send_message(chat_id, f"✅ Сохранено:\n`{new_neg[:100]}`", parse_mode="Markdown")
-    bot.delete_message(chat_id, original_msg_id)
+        bot.send_message(chat_id, f"✅ Сохранено:\n<code>{_h(_cut(new_neg, 100))}</code>", parse_mode="HTML")
+    try:
+        bot.delete_message(chat_id, original_msg_id)
+    except Exception:
+        pass
     show_settings(message)
+
+@bot.callback_query_handler(func=lambda call: call.data == "neg_reset")
+def handle_neg_reset(call):
+    set_user_negative_prompt(str(call.message.chat.id), None)
+    _safe_answer(call, "Сброшено до стандартного")
+    _show_negative_menu(call.message.chat.id, str(call.message.chat.id), call.message.message_id)
+
+def _build_embeddings_menu(user_id, page):
+    names = get_available_embeddings()
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    if names is None or not names:
+        if names is None:
+            text = ("⚠️ <b>Не удалось получить список эмбеддингов.</b>\n\n"
+                    "Проверьте, что WebUI запущен с флагом <code>--api</code>, и нажмите «Обновить».")
+        else:
+            text = ("📭 <b>В WebUI нет загруженных эмбеддингов.</b>\n\n"
+                    "Положите файлы в папку <code>embeddings</code> и нажмите «Обновить».")
+        markup.add(types.InlineKeyboardButton("🔄 Обновить список", callback_data="negemb_refresh"))
+        markup.add(types.InlineKeyboardButton("◀️ Назад", callback_data="set_neg"))
+        return text, markup
+
+    selected = set(get_user_negative_embeddings(user_id))
+    pages = (len(names) + EMBEDDINGS_PER_PAGE - 1) // EMBEDDINGS_PER_PAGE
+    page = max(0, min(page, pages - 1))
+    text = (
+        "🧬 <b>Негативные эмбеддинги</b>\n\n"
+        f"Выбрано: {len(selected)} из {len(names)}\n"
+        f"{_h(_cut(', '.join(sorted(selected, key=str.lower)), 500)) if selected else 'Ничего не выбрано'}\n\n"
+        "Нажимайте на эмбеддинги, чтобы включать и выключать их — можно выбрать несколько."
+    )
+    for name in names[page * EMBEDDINGS_PER_PAGE:(page + 1) * EMBEDDINGS_PER_PAGE]:
+        label = ("✅ " if name in selected else "⬜ ") + _cut(name, 48)
+        markup.add(types.InlineKeyboardButton(label, callback_data=f"negemb_t_{_emb_id(name)}_{page}"))
+    if pages > 1:
+        markup.row(
+            types.InlineKeyboardButton("◀️", callback_data=f"negemb_p_{(page - 1) % pages}"),
+            types.InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="negemb_noop"),
+            types.InlineKeyboardButton("▶️", callback_data=f"negemb_p_{(page + 1) % pages}"),
+        )
+    markup.row(
+        types.InlineKeyboardButton("🔄 Обновить", callback_data="negemb_refresh"),
+        types.InlineKeyboardButton("🧹 Снять все", callback_data="negemb_clear"),
+    )
+    markup.add(types.InlineKeyboardButton("↩️ Рекомендованные по умолчанию", callback_data="negemb_default"))
+    markup.add(types.InlineKeyboardButton("◀️ Назад", callback_data="set_neg"))
+    return text, markup
+
+def _show_embeddings_menu(call, page):
+    text, markup = _build_embeddings_menu(str(call.message.chat.id), page)
+    _edit_or_send(call.message.chat.id, call.message.message_id, text, markup)
+
+@bot.callback_query_handler(func=lambda call: call.data == "neg_emb")
+def handle_neg_embeddings_button(call):
+    _safe_answer(call)
+    _show_embeddings_menu(call, 0)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("negemb_p_"))
+def handle_negemb_page(call):
+    try:
+        page = int(call.data[len("negemb_p_"):])
+    except ValueError:
+        page = 0
+    _safe_answer(call)
+    _show_embeddings_menu(call, page)
+
+@bot.callback_query_handler(func=lambda call: call.data == "negemb_noop")
+def handle_negemb_noop(call):
+    _safe_answer(call)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("negemb_t_"))
+def handle_negemb_toggle(call):
+    user_id = str(call.message.chat.id)
+    try:
+        emb_id, page_text = call.data[len("negemb_t_"):].rsplit("_", 1)
+        page = int(page_text)
+    except ValueError:
+        _safe_answer(call)
+        return
+    name = next((n for n in (get_available_embeddings() or []) if _emb_id(n) == emb_id), None)
+    if name is None:
+        _safe_answer(call, "Эмбеддинг не найден — обновите список", show_alert=True)
+        return
+    state = toggle_user_negative_embedding(user_id, name)
+    _safe_answer(call, f"{'✅ Добавлен' if state else '➖ Убран'}: {name}"[:200])
+    _show_embeddings_menu(call, page)
+
+@bot.callback_query_handler(func=lambda call: call.data == "negemb_clear")
+def handle_negemb_clear(call):
+    set_user_negative_embeddings(str(call.message.chat.id), [])
+    _safe_answer(call, "Выбор снят")
+    _show_embeddings_menu(call, 0)
+
+@bot.callback_query_handler(func=lambda call: call.data == "negemb_default")
+def handle_negemb_default(call):
+    set_user_negative_embeddings(str(call.message.chat.id), None)
+    _safe_answer(call, "Возвращены рекомендованные")
+    _show_embeddings_menu(call, 0)
+
+@bot.callback_query_handler(func=lambda call: call.data == "negemb_refresh")
+def handle_negemb_refresh(call):
+    _safe_answer(call, "Обновляю список...")
+    refresh_embeddings_on_server()
+    get_available_embeddings(force_refresh=True)
+    _show_embeddings_menu(call, 0)
 
 # =========== АПСКЕЙЛ, ПОВТОР, РЕДАКТИРОВАНИЕ ===========
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("upscale_"))
 def handle_upscale_callback(call):
     user_id = str(call.message.chat.id)
-    if user_id not in last_images:
+    source_image = last_images.get(user_id)
+    if source_image is None:
         bot.answer_callback_query(call.id, "Нет изображения!")
         return
     factor = int(call.data.split("_")[1])
     bot.answer_callback_query(call.id, f"Увеличиваю в {factor}x...")
-    bot.edit_message_text("⏳ Апскейл...", call.message.chat.id, call.message.message_id)
+    try:
+        bot.edit_message_text("⏳ Апскейл...", call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
     # --- Логирование апскейла (без промпта, но с историей действий пользователя) ---
     gen_id = prompt_logger.log_request(user_id, "upscale", original_prompt="", upscale_factor=factor)
     start_time = time.time()
     try:
-        upscaled = upscale_image(last_images[user_id], upscale_factor=float(factor))
+        upscaled = upscale_image(source_image, upscale_factor=float(factor))
         prompt_logger.log_result(gen_id, user_id, "upscale", "", duration_sec=time.time() - start_time, upscale_factor=factor)
-        bot.send_photo(call.message.chat.id, upscaled, caption=f"✅ {factor}x")
+        # После апскейла картинка часто весит >10 МБ или шире 10000 px по сумме сторон — тогда уйдёт файлом
+        send_image_smart(call.message.chat.id, upscaled, caption=f"✅ {factor}x")
         last_images[user_id] = upscaled
-        bot.delete_message(call.message.chat.id, call.message.message_id)
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
     except Exception as e:
         prompt_logger.log_error(gen_id, user_id, "upscale", "", e, duration_sec=time.time() - start_time)
         bot.send_message(call.message.chat.id, f"❌ Ошибка: {str(e)}")
@@ -1821,13 +2204,14 @@ def handle_repeat_generation(call):
         bot.answer_callback_query(call.id, "Для ControlNet используйте кнопку 'Тот же скелет'", show_alert=True)
         return
 
+    cfg = config.get('settings', {})
     confirm_text = (
-        "🔄 **Повтор генерации**\n\n"
-        f"📝 **Промпт:**\n`{config['original_prompt'][:100]}{'...' if len(config['original_prompt']) > 100 else ''}`\n\n"
-        f"📐 Размер: {config['settings']['width']}x{config['settings']['height']}\n"
-        f"⏱️ Шаги: {config['settings']['steps']}\n"
-        f"🎚️ CFG: {config['settings']['cfg_scale']}\n"
-        f"🎲 Seed: `{config['seed']}`\n"
+        "🔄 <b>Повтор генерации</b>\n\n"
+        f"📝 <b>Промпт:</b>\n<code>{_h(_cut(config.get('original_prompt', ''), 100))}</code>\n\n"
+        f"📐 Размер: {cfg.get('width', '?')}x{cfg.get('height', '?')}\n"
+        f"⏱️ Шаги: {cfg.get('steps', '?')}\n"
+        f"🎚️ CFG: {cfg.get('cfg_scale', '?')}\n"
+        f"🎲 Seed: <code>{config.get('seed')}</code>\n"
     )
     if config.get('face_enabled'):
         confirm_text += "🎭 Замена лица: включена\n"
@@ -1837,8 +2221,8 @@ def handle_repeat_generation(call):
         types.InlineKeyboardButton("✅ Да, повторить", callback_data="repeat_confirm"),
         types.InlineKeyboardButton("❌ Нет, отмена", callback_data="repeat_cancel")
     )
-    bot.send_message(call.message.chat.id, confirm_text, parse_mode="Markdown", reply_markup=markup)
-    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, confirm_text, parse_mode="HTML", reply_markup=markup)
+    _safe_answer(call)
 
 @bot.callback_query_handler(func=lambda call: call.data == "repeat_confirm")
 def repeat_confirm(call):
@@ -1851,16 +2235,25 @@ def repeat_confirm(call):
     if config.get('type') == 'controlnet':
         bot.answer_callback_query(call.id, "Для ControlNet используйте кнопку 'Тот же скелет'", show_alert=True)
         return
+    # Отвечаем на callback СРАЗУ: раньше ответ шёл после многоминутной генерации — кнопка «висела» с индикатором,
+    # а запоздалый ответ падал с «query is too old».
+    _safe_answer(call, "Повторяю генерацию...")
     chat_id = call.message.chat.id
-    bot.edit_message_text("🔄 **Повторяю генерацию...**", chat_id, call.message.message_id)
+    try:
+        bot.edit_message_text("🔄 Повторяю генерацию...", chat_id, call.message.message_id)
+    except Exception:
+        pass
     status_msg = bot.send_message(chat_id, "🎨 **Генерация**\n\n`[░░░░░░░░░░░░░░░░░░░░]` 0%\n\n⏳ Подготовка...", parse_mode="Markdown")
     def on_progress(progress, eta):
         update_progress_message(status_msg.message_id, chat_id, progress, eta)
     def on_status(text):
         update_status_message(status_msg.message_id, chat_id, text)
     try:
+        # Точный повтор: промпты берутся ровно такими, какие ушли в WebUI в прошлый раз
+        # (без повторного перевода через Ollama, без дублирования LoRA и новых «фраз разнообразия»)
         image_file, used_seed, original_prompt, processed_prompt = generate_image(
-            config['prompt'], config['settings'], user_id, on_progress, on_status, fixed_seed=config['seed']
+            config['prompt'], dict(config['settings']), user_id, on_progress, on_status, fixed_seed=config['seed'],
+            exact_prompt=config.get('final_prompt'), exact_negative=config.get('final_negative')
         )
         final_image_file = image_file
         face_replacement_success = False
@@ -1885,37 +2278,43 @@ def repeat_confirm(call):
             bot.delete_message(chat_id, status_msg.message_id)
         except:
             pass
-        caption = f"✨ **Исходный промпт:**\n`{config['original_prompt']}`\n\n🤖 **Обработанный промпт:**\n`{processed_prompt}`\n\n📐 **Размер:** {config['settings']['width']}x{config['settings']['height']}\n⏱️ **Шаги:** {config['settings']['steps']}\n🎚️ **CFG:** {config['settings']['cfg_scale']}\n🎲 **Seed:** `{used_seed}` (повтор)\n"
+        cfg = config['settings']
+        caption = (
+            f"✨ <b>Исходный промпт:</b>\n<code>{_h(_cut(config['original_prompt'], 700))}</code>\n\n"
+            f"🤖 <b>Обработанный промпт:</b>\n<code>{_h(_cut(processed_prompt, 1200))}</code>\n\n"
+            f"📐 <b>Размер:</b> {cfg.get('width')}x{cfg.get('height')}\n"
+            f"⏱️ <b>Шаги:</b> {cfg.get('steps')}\n"
+            f"🎚️ <b>CFG:</b> {cfg.get('cfg_scale')}\n"
+            f"🎲 <b>Seed:</b> <code>{used_seed}</code> (повтор)\n"
+        )
         if face_replacement_success:
-            caption += "🎭 **Лицо заменено**\n"
-        sent_msg = bot.send_photo(chat_id, final_image_file, caption=caption, parse_mode="Markdown")
+            caption += "🎭 <b>Лицо заменено</b>\n"
+        sent_msg = send_image_smart(chat_id, final_image_file, caption=caption, parse_mode="HTML")
         last_images[user_id] = final_image_file
         last_message_ids[user_id] = sent_msg.message_id
         last_seeds[user_id] = used_seed
         bot.send_message(chat_id, "🔧 **Действия с изображением:**", reply_markup=get_image_actions_keyboard(), reply_to_message_id=sent_msg.message_id)
     except Exception as e:
-        try:
-            bot.edit_message_text(f"❌ Ошибка: {str(e)}", chat_id, status_msg.message_id)
-        except:
-            bot.send_message(chat_id, f"❌ Ошибка: {str(e)}")
-    bot.answer_callback_query(call.id)
+        _report_error(chat_id, status_msg.message_id, e)
 
 @bot.callback_query_handler(func=lambda call: call.data == "repeat_cancel")
 def repeat_cancel(call):
-    bot.edit_message_text("❌ Повтор отменен", call.message.chat.id, call.message.message_id)
-    bot.answer_callback_query(call.id)
+    try:
+        bot.edit_message_text("❌ Повтор отменен", call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    _safe_answer(call)
 
 # =========== РАСШИРЕННАЯ ГЕНЕРАЦИЯ ===========
 
 def extended_generation_prompt(message):
-    if message.text in BUTTON_TEXTS or message.text.startswith('/'):
+    text = _text(message)
+    if _is_cancel_text(text):
         bot.send_message(message.chat.id, "❌ Отменено.")
         return
     user_id = str(message.chat.id)
-    prompt = message.text.strip()
-    if user_id not in temp_data:
-        temp_data[user_id] = {}
-    temp_data[user_id]['prompt'] = prompt
+    prompt = text
+    temp_data.setdefault(user_id, {})['prompt'] = prompt
     current_neg = get_user_negative_prompt(user_id)
     is_custom = current_neg != DEFAULT_NEGATIVE_PROMPT
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -1924,16 +2323,16 @@ def extended_generation_prompt(message):
         types.InlineKeyboardButton(f"✏️ Свой негатив{' ✓' if is_custom else ''}", callback_data="ext_neg_custom"),
         types.InlineKeyboardButton("⚙️ Изменить в настройках", callback_data="ext_neg_settings")
     )
-    bot.send_message(message.chat.id, f"📝 **Промпт:** *{prompt[:100]}*\n\nВыбери негативный промпт:", parse_mode="Markdown", reply_markup=markup)
+    bot.send_message(message.chat.id, f"📝 <b>Промпт:</b> <i>{_h(_cut(prompt, 100))}</i>\n\nВыбери негативный промпт:", parse_mode="HTML", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("ext_neg_"))
 def handle_extended_neg_choice(call):
     user_id = str(call.message.chat.id)
-    if user_id not in temp_data or 'prompt' not in temp_data[user_id]:
+    prompt = temp_data.get(user_id, {}).get('prompt')
+    if not prompt:
         bot.answer_callback_query(call.id, "Сессия истекла")
         bot.send_message(call.message.chat.id, "Нажми кнопку генерации заново.")
         return
-    prompt = temp_data[user_id]['prompt']
     if call.data == "ext_neg_default":
         negative_prompt = DEFAULT_NEGATIVE_PROMPT
         neg_source = "стандартный"
@@ -1949,6 +2348,10 @@ def handle_extended_neg_choice(call):
         return
     else:
         return
+    # Сессия использована: убираем промпт сразу, чтобы двойное нажатие кнопки не запустило генерацию дважды
+    session = temp_data.get(user_id)
+    if session is not None:
+        session.pop('prompt', None)
     bot.answer_callback_query(call.id, f"Генерация с {neg_source} негативом...")
     # --- Логирование промпта пользователя (расширенная генерация) ---
     gen_id = prompt_logger.log_request(
@@ -1961,11 +2364,23 @@ def handle_extended_neg_choice(call):
         update_progress_message(status_msg.message_id, call.message.chat.id, progress, eta)
     settings = get_user_settings(user_id)
     try:
-        images, used_seed = generate_txt2img_advanced(prompt, negative_prompt, settings, on_progress)
-        bot.delete_message(call.message.chat.id, status_msg.message_id)
+        images, used_seed = generate_txt2img_advanced(prompt, negative_prompt, settings, on_progress, user_id=user_id)
+        if not images:
+            raise Exception("WebUI не вернул изображений")
+        try:
+            bot.delete_message(call.message.chat.id, status_msg.message_id)
+        except Exception:
+            pass
         for image_file in images:
-            caption = f"✨ **Промпт:**\n`{prompt}`\n\n📐 **Размер:** {settings.get('width', 512)}x{settings.get('height', 768)}\n⏱️ **Шаги:** {settings.get('steps', 20)}\n🎚️ **CFG:** {settings.get('cfg_scale', 7.0)}\n🚫 **Негатив:** {neg_source}\n🎲 **Seed:** `{used_seed}`\n"
-            sent_msg = bot.send_photo(call.message.chat.id, image_file, caption=caption, parse_mode="Markdown")
+            caption = (
+                f"✨ <b>Промпт:</b>\n<code>{_h(_cut(prompt, 900))}</code>\n\n"
+                f"📐 <b>Размер:</b> {settings.get('width', 512)}x{settings.get('height', 768)}\n"
+                f"⏱️ <b>Шаги:</b> {settings.get('steps', 20)}\n"
+                f"🎚️ <b>CFG:</b> {settings.get('cfg_scale', 7.0)}\n"
+                f"🚫 <b>Негатив:</b> {neg_source}\n"
+                f"🎲 <b>Seed:</b> <code>{used_seed}</code>\n"
+            )
+            sent_msg = send_image_smart(call.message.chat.id, image_file, caption=caption, parse_mode="HTML")
             last_images[user_id] = image_file
             last_message_ids[user_id] = sent_msg.message_id
             last_seeds[user_id] = used_seed
@@ -1973,7 +2388,9 @@ def handle_extended_neg_choice(call):
                 "type": "txt2img",
                 "prompt": prompt,
                 "original_prompt": prompt,
-                "settings": settings,
+                "final_prompt": getattr(image_file, "final_prompt", None),
+                "final_negative": getattr(image_file, "final_negative", None),
+                "settings": dict(settings),
                 "seed": used_seed,
                 "face_enabled": False
             }
@@ -1986,8 +2403,8 @@ def handle_extended_neg_choice(call):
         bot.send_message(call.message.chat.id, "🔧 **Действия с изображением:**", reply_markup=get_image_actions_keyboard())
     except Exception as e:
         prompt_logger.log_error(gen_id, user_id, "txt2img_advanced", prompt, e, duration_sec=time.time() - start_time)
-        bot.edit_message_text(f"❌ Ошибка: {str(e)}", call.message.chat.id, status_msg.message_id)
-    del temp_data[user_id]
+        _report_error(call.message.chat.id, status_msg.message_id, e)
+    temp_data.pop(user_id, None)  # раньше del по несуществующему ключу падал с KeyError при гонке
 
 
 # =========== РЕДАКТИРОВАНИЕ (IMG2IMG) ===========
@@ -2061,9 +2478,7 @@ def handle_sampler_button(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("sampler_set_"))
 def handle_sampler_choice(call):
     user_id = str(call.message.chat.id)
-    sampler_name = call.data.replace("sampler_set_", "")
-    
-    from settings import set_user_sampler, get_user_sampler
+    sampler_name = call.data[len("sampler_set_"):]
     set_user_sampler(user_id, sampler_name)
     
     bot.answer_callback_query(call.id, f"✅ Сэмплер: {sampler_name}")
@@ -2097,24 +2512,19 @@ def handle_sampler_show_all(call):
 def handle_edit_type(call):
     edit_type = call.data.split("_")[1]
     user_id = str(call.message.chat.id)
-    if user_id not in last_images:
+    if last_images.get(user_id) is None:
         bot.answer_callback_query(call.id, "Нет изображения для редактирования", show_alert=True)
         return
-    if user_id not in temp_data:
-        temp_data[user_id] = {}
-    temp_data[user_id]['edit_type'] = edit_type
-    temp_data[user_id]['original_image'] = last_images[user_id]
+    # Саму картинку в temp_data больше не кладём (она нигде не читалась, но удерживала память): берётся last_images
+    temp_data.setdefault(user_id, {})['edit_type'] = edit_type
     bot.edit_message_text(f"✍️ Введите описание изменений для **{edit_type}**:\n\nНапример: 'добавить мускулы' или 'заменить фон на городской пейзаж'", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
     bot.register_next_step_handler(call.message, process_edit_prompt, edit_type, user_id, call.message.message_id)
     bot.answer_callback_query(call.id)
 
 def process_edit_prompt(message, edit_type, user_id, original_msg_id):
-    if message.text in BUTTON_TEXTS or message.text.startswith('/'):
-        bot.send_message(message.chat.id, "❌ Это кнопка или команда. Отправьте текст промпта.")
-        return
-    prompt = message.text.strip()
-    if not prompt:
-        bot.send_message(message.chat.id, "❌ Промпт не может быть пустым. Отмена.")
+    prompt = _text(message)
+    if _is_cancel_text(prompt):
+        bot.send_message(message.chat.id, "❌ Нужен текст промпта (не кнопка, команда или файл). Редактирование отменено.")
         return
     original_image = last_images.get(user_id)
     if not original_image:
@@ -2128,22 +2538,22 @@ def process_edit_prompt(message, edit_type, user_id, original_msg_id):
         negative_prompt=get_user_negative_prompt(user_id),
     )
     start_time = time.time()
-    status_msg = bot.send_message(message.chat.id, f"🔄 Редактирую **{edit_type}**...\nПромпт: `{prompt[:50]}`", parse_mode="Markdown")
+    status_msg = bot.send_message(message.chat.id, f"🔄 Редактирую <b>{_h(edit_type)}</b>...\nПромпт: <code>{_h(_cut(prompt, 50))}</code>", parse_mode="HTML")
     def on_progress(progress, eta):
         update_progress_message(status_msg.message_id, message.chat.id, progress, eta)
     def on_status(text):
         update_status_message(status_msg.message_id, message.chat.id, text)
     try:
         if edit_type == "all":
-            new_image = edit_all_image(prompt, original_image, settings, on_progress, on_status)
+            new_image = edit_all_image(prompt, original_image, settings, on_progress, on_status, user_id=user_id)
         elif edit_type == "body":
-            new_image = edit_body_part(prompt, original_image, settings, "body", on_progress, on_status)
+            new_image = edit_body_part(prompt, original_image, settings, "body", on_progress, on_status, user_id=user_id)
         elif edit_type == "background":
-            new_image = edit_body_part(prompt, original_image, settings, "background", on_progress, on_status)
+            new_image = edit_body_part(prompt, original_image, settings, "background", on_progress, on_status, user_id=user_id)
         elif edit_type == "clothes":
-            new_image = edit_body_part(prompt, original_image, settings, "clothes", on_progress, on_status)
+            new_image = edit_body_part(prompt, original_image, settings, "clothes", on_progress, on_status, user_id=user_id)
         elif edit_type == "pose":
-            new_image = edit_pose(prompt, original_image, settings, on_progress, on_status)
+            new_image = edit_pose(prompt, original_image, settings, on_progress, on_status, user_id=user_id)
         else:
             raise ValueError(f"Неизвестный тип редактирования: {edit_type}")
         final_image = apply_face_replacement_if_enabled(user_id, new_image)
@@ -2151,14 +2561,15 @@ def process_edit_prompt(message, edit_type, user_id, original_msg_id):
             bot.delete_message(message.chat.id, status_msg.message_id)
         except:
             pass
-        sent_msg = bot.send_photo(message.chat.id, final_image, caption=f"✅ Редактирование **{edit_type}**\nПромпт: `{prompt}`", parse_mode="Markdown")
+        sent_msg = send_image_smart(message.chat.id, final_image,
+                                    caption=f"✅ Редактирование <b>{_h(edit_type)}</b>\nПромпт: <code>{_h(_cut(prompt, 800))}</code>", parse_mode="HTML")
         last_images[user_id] = final_image
         last_message_ids[user_id] = sent_msg.message_id
         last_configs[user_id] = {
             "type": "txt2img",
             "prompt": prompt,
             "original_prompt": prompt,
-            "settings": settings,
+            "settings": dict(settings),
             "seed": 0,
             "face_enabled": get_face_enabled(user_id)
         }
@@ -2169,17 +2580,16 @@ def process_edit_prompt(message, edit_type, user_id, original_msg_id):
         bot.send_message(message.chat.id, "🔧 Действия с изображением:", reply_markup=get_image_actions_keyboard())
     except Exception as e:
         prompt_logger.log_error(gen_id, user_id, gen_type, prompt, e, duration_sec=time.time() - start_time)
-        bot.edit_message_text(f"❌ Ошибка: {str(e)}", message.chat.id, status_msg.message_id)
-    if user_id in temp_data:
-        temp_data[user_id].pop('edit_type', None)
+        _report_error(message.chat.id, status_msg.message_id, e)
+    temp_data.get(user_id, {}).pop('edit_type', None)
 
-def edit_all_image(prompt, image, settings, progress_callback=None, status_callback=None):
+def edit_all_image(prompt, image, settings, progress_callback=None, status_callback=None, user_id="default"):
     if status_callback:
         status_callback("🔄 Генерация через img2img...")
-    images = generate_img2img(prompt, image, settings, progress_callback)
+    images = generate_img2img(prompt, image, settings, progress_callback, user_id=user_id)
     return images[0] if images else image
 
-def edit_body_part(prompt, image, settings, part, progress_callback=None, status_callback=None):
+def edit_body_part(prompt, image, settings, part, progress_callback=None, status_callback=None, user_id="default"):
     from segmentation import get_mask_for_part
     if status_callback:
         status_callback(f"🔄 Выделяю {part}...")
@@ -2188,10 +2598,10 @@ def edit_body_part(prompt, image, settings, part, progress_callback=None, status
         raise Exception(f"Не удалось выделить {part}. Попробуйте другой тип.")
     if status_callback:
         status_callback(f"🔄 Перерисовываю {part}...")
-    new_image = generate_inpaint(prompt, image, mask, settings, progress_callback)
+    new_image = generate_inpaint(prompt, image, mask, settings, progress_callback, user_id=user_id)
     return new_image
 
-def edit_pose(prompt, image, settings, progress_callback=None, status_callback=None):
+def edit_pose(prompt, image, settings, progress_callback=None, status_callback=None, user_id="default"):
     try:
         from segmentation import get_pose_control_image
     except ImportError:
@@ -2204,11 +2614,13 @@ def edit_pose(prompt, image, settings, progress_callback=None, status_callback=N
     if status_callback:
         status_callback("🔄 Генерация с ControlNet...")
     # Используем функцию generate_controlnet из controlnet_manager
-    new_image = generate_controlnet(prompt, image, control_image, "openpose", "control_v11p_sd15_openpose", settings, progress_callback)
+    new_image = generate_controlnet(prompt, image, control_image, "openpose", "control_v11p_sd15_openpose", settings, progress_callback, user_id=user_id)
     return new_image
 # =========== ОБРАБОТЧИКИ LORA ===========
 
-@bot.callback_query_handler(func=lambda call: call.data == "manage_lora")
+def _lora_id(lora_name):
+    return hashlib.md5(lora_name.encode("utf-8")).hexdigest()[:10]
+
 def handle_manage_lora(call):
     user_id = str(call.message.chat.id)
     available = get_available_loras()
@@ -2216,14 +2628,15 @@ def handle_manage_lora(call):
     markup = types.InlineKeyboardMarkup(row_width=2)
     for lora_name, info in available.items():
         status = "✅" if lora_enabled.get(lora_name, True) else "❌"
-        btn_text = f"{status} {info['name']}"
-        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"lora_toggle_{lora_name}"))
+        btn_text = _cut(f"{status} {info['name']}", 60)
+        # callback_data у Telegram ограничена 64 байтами — длинные/русские имена LoRA её превышали и ломали меню
+        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"lora_toggle_{_lora_id(lora_name)}"))
     # Кнопка обновления списка
     markup.add(types.InlineKeyboardButton("🔄 Обновить список LoRA", callback_data="refresh_lora_list"))
     markup.add(types.InlineKeyboardButton("◀️ Назад в настройки", callback_data="back_to_settings"))
-    
+
     text = f"🎛️ **Управление LoRA**\n\nВыберите LoRA для включения/отключения.\nОни будут автоматически добавляться в промпт при генерации.\n\nДоступно: {len(available)} LoRA"
-    
+
     try:
         bot.edit_message_text(
             text,
@@ -2233,14 +2646,11 @@ def handle_manage_lora(call):
             reply_markup=markup
         )
     except Exception as e:
-        if "message is not modified" in str(e):
-            # Если содержимое не изменилось, просто отвечаем на коллбэк без редактирования
-            bot.answer_callback_query(call.id, "Список актуален")
-        else:
+        if "message is not modified" not in str(e):
             # В случае другой ошибки – удаляем и отправляем новое сообщение
             try:
                 bot.delete_message(call.message.chat.id, call.message.message_id)
-            except:
+            except Exception:
                 pass
             bot.send_message(
                 call.message.chat.id,
@@ -2248,147 +2658,42 @@ def handle_manage_lora(call):
                 parse_mode="Markdown",
                 reply_markup=markup
             )
-            bot.answer_callback_query(call.id)
-    else:
-        bot.answer_callback_query(call.id)
+    _safe_answer(call)
+
+@bot.callback_query_handler(func=lambda call: call.data == "manage_lora")
+def handle_manage_lora_button(call):
+    handle_manage_lora(call)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("lora_toggle_"))
 def handle_lora_toggle(call):
     user_id = str(call.message.chat.id)
-    lora_name = call.data.replace("lora_toggle_", "")
+    lora_id = call.data[len("lora_toggle_"):]
     available = get_available_loras()
-    if lora_name not in available:
-        bot.answer_callback_query(call.id, "❌ LoRA не найдена", show_alert=True)
+    lora_name = next((name for name in available if _lora_id(name) == lora_id), None)
+    if lora_name is None:
+        _safe_answer(call, "❌ LoRA не найдена — обновите список", show_alert=True)
         return
     current = get_user_lora_enabled(user_id).get(lora_name, True)
     new_state = not current
     set_user_lora_enabled(user_id, lora_name, new_state)
     status = "включена ✅" if new_state else "выключена ❌"
-    bot.answer_callback_query(call.id, f"LoRA {available[lora_name]['name']} {status}")
+    _safe_answer(call, f"LoRA {available[lora_name]['name']} {status}"[:200])
     # Перерисовываем меню (редактируем то же сообщение)
     handle_manage_lora(call)
 
 @bot.callback_query_handler(func=lambda call: call.data == "refresh_lora_list")
 def handle_refresh_lora(call):
-    bot.answer_callback_query(call.id, "🔄 Обновляю список...")
-    new_loras = fetch_loras_from_api()
+    new_loras = get_available_loras(force_refresh=True)
     if new_loras:
-        set_available_loras(new_loras)
-        # Обновляем меню
+        _safe_answer(call, "✅ Список обновлён!")
         handle_manage_lora(call)
-        bot.answer_callback_query(call.id, "✅ Список обновлён!", show_alert=False)
     else:
-        bot.answer_callback_query(call.id, "❌ Не удалось обновить список", show_alert=True)
+        _safe_answer(call, "❌ Не удалось обновить список", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data == "back_to_settings")
 def handle_back_to_settings(call):
     show_settings(call.message)
     bot.answer_callback_query(call.id)
-
-# =========== ОБРАБОТЧИКИ НЕГАТИВНЫХ ЭМБЕДДИНГОВ (из API WebUI) ===========
-
-def get_neg_embeddings_keyboard(user_id):
-    """Клавиатура управления негативными эмбеддингами, полученными из API (/sdapi/v1/embeddings).
-
-    Нажатие на эмбеддинг добавляет его в негативный промпт пользователя, повторное
-    нажатие — удаляет. Отфильтрованы только эмбеддинги, похожие на негативные.
-    """
-    available = get_available_embeddings()
-    negative_names = filter_negative_embeddings(available)
-    selected = set(get_user_negative_embeddings(user_id))
-
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    for name in negative_names:
-        status = "✅" if name in selected else "❌"
-        shape = int((available.get(name) or {}).get("shape") or 0)
-        label = f"{status} {name}" + (f" [{shape}]" if shape else "")
-        markup.add(types.InlineKeyboardButton(label, callback_data=f"neg_emb_toggle_{name}"))
-
-    markup.add(types.InlineKeyboardButton("🔄 Обновить список эмбеддингов", callback_data="refresh_neg_embeddings"))
-    markup.add(types.InlineKeyboardButton("❌ Очистить выбранные", callback_data="clear_neg_embeddings"))
-    markup.add(types.InlineKeyboardButton("◀️ Назад в настройки", callback_data="back_to_settings"))
-    return markup, len(negative_names), sorted(selected, key=str.lower)
-
-
-def show_neg_embeddings_menu(message_or_call):
-    """Отправляет/редактирует сообщение с меню негативных эмбеддингов."""
-    if hasattr(message_or_call, "message"):  # callback_query
-        chat_id = message_or_call.message.chat.id
-        message_id = message_or_call.message.message_id
-        user_id = str(chat_id)
-    else:  # message
-        chat_id = message_or_call.chat.id
-        message_id = None
-        user_id = str(chat_id)
-
-    markup, total, selected = get_neg_embeddings_keyboard(user_id)
-
-    if total == 0:
-        text = (
-            "🧨 **Негативные эмбеддинги**\n\n"
-            "API не вернул ни одного эмбеддинга, похожего на негативный.\n"
-            "Проверьте, что WebUI запущен с --api и файлы .pt/.safetensors лежат в папке embeddings."
-        )
-    else:
-        sel_text = "\n".join(f"`{s}`" for s in selected) if selected else "_ничего не выбрано_"
-        text = (
-            "🧨 **Негативные эмбеддинги из API**\n\n"
-            f"Найдено: {total}. Нажми на эмбеддинг — он добавится в негативный промпт, повторное нажатие — уберёт его оттуда.\n\n"
-            "**Выбрано в негативе:**\n" + sel_text
-        )
-
-    if message_id is not None:
-        try:
-            bot.edit_message_text(text, chat_id, message_id, parse_mode="Markdown", reply_markup=markup)
-            return
-        except Exception as e:
-            if "message is not modified" in str(e):
-                return
-    bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "manage_neg_embeddings")
-def handle_manage_neg_embeddings(call):
-    bot.answer_callback_query(call.id)
-    show_neg_embeddings_menu(call)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("neg_emb_toggle_"))
-def handle_neg_emb_toggle(call):
-    user_id = str(call.message.chat.id)
-    emb_name = call.data.replace("neg_emb_toggle_", "", 1)
-    available = get_available_embeddings()
-    if emb_name not in available:
-        bot.answer_callback_query(call.id, "❌ Эмбеддинг не найден в API", show_alert=True)
-        return
-    current = get_user_negative_embeddings(user_id)
-    if emb_name in current:
-        remove_user_negative_embedding(user_id, emb_name)
-        bot.answer_callback_query(call.id, f"Негативный эмбеддинг {emb_name} удалён из промпта ❌")
-    else:
-        add_user_negative_embedding(user_id, emb_name)
-        bot.answer_callback_query(call.id, f"Негативный эмбеддинг {emb_name} добавлен в промпт ✅")
-    show_neg_embeddings_menu(call)
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "refresh_neg_embeddings")
-def handle_refresh_neg_embeddings(call):
-    bot.answer_callback_query(call.id, "🔄 Обновляю список...")
-    refresh_embeddings_on_server()
-    new_list = fetch_embeddings_from_api(force_refresh=True)
-    if new_list:
-        show_neg_embeddings_menu(call)
-    else:
-        bot.send_message(call.message.chat.id, "❌ Не удалось получить список эмбеддингов из API")
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "clear_neg_embeddings")
-def handle_clear_neg_embeddings(call):
-    user_id = str(call.message.chat.id)
-    removed = len(get_user_negative_embeddings(user_id))
-    set_user_negative_embeddings(user_id, [])
-    bot.answer_callback_query(call.id, f"❌ Убрано из негативного промпта: {removed}")
-    show_neg_embeddings_menu(call)
 
 # =========== ЗАПУСК БОТА ===========
 
@@ -2417,6 +2722,13 @@ if __name__ == "__main__":
             print(f"⚠️ Stable Diffusion API НЕдоступен по адресу {config.SD_BASE_URL}. Проверьте, запущен ли WebUI с --api")
     except Exception as e:
         print(f"⚠️ Не удалось проверить доступность SD API: {e}")
+
+    # Список негативных эмбеддингов из WebUI (кэшируется; обновляется кнопкой в меню)
+    try:
+        embeddings = get_available_embeddings(force_refresh=True)
+        print(f"🧬 Эмбеддингов в WebUI: {len(embeddings) if embeddings is not None else 'не удалось получить'}")
+    except Exception as e:
+        print(f"⚠️ Не удалось получить список эмбеддингов: {e}")
 
     # Фиксируем модель по умолчанию (загруженную в WebUI сейчас) — для пользователей без выбора
     try:

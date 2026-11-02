@@ -4,13 +4,14 @@ import re
 import json
 import random
 import time
+import threading
 import urllib.request
 import urllib.error
 from typing import Dict, List, Optional, Callable, Tuple, Any
 
 # Импорт из settings и embeddings_manager
-from settings import get_user_negative_prompt, get_diversity_mode, get_use_advanced_negative, get_prompt_processing_enabled, get_active_lora_tags, resolve_model, get_user_negative_embeddings
-from embeddings_manager import get_negative_prompt_with_embeddings
+from settings import get_user_negative_prompt, get_diversity_mode, get_use_advanced_negative, get_prompt_processing_enabled, get_active_lora_tags, resolve_model, get_user_settings, effective_negative_embeddings
+from embeddings_manager import get_negative_prompt_with_embeddings, _merge_unique_tags
 from prompt_processor import fast_process
 
 # ===== КОНФИГУРАЦИЯ =====
@@ -67,13 +68,36 @@ def call_api(api_endpoint: str, **payload) -> dict:
         data=data,
     )
     try:
-        response = urllib.request.urlopen(request, timeout=120)
-        return json.loads(response.read().decode('utf-8'))
+        with urllib.request.urlopen(request, timeout=120) as response:
+            return json.loads(response.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
-        error_body = e.read().decode('utf-8')
+        error_body = e.read().decode('utf-8', errors='replace')
         raise Exception(f"HTTP {e.code}: {error_body}")
     except urllib.error.URLError as e:
         raise Exception(f"URL Error: {e.reason}")
+
+
+# ===== РАЗМЕР ВЫХОДА ДЛЯ img2img / inpaint =====
+MAX_EDIT_SIDE = 1280  # максимальная сторона при редактировании (защита от нехватки видеопамяти)
+
+
+def fit_dims_to_image(image_bytes: bytes, fallback_width: int, fallback_height: int) -> Tuple[int, int]:
+    """
+    Размер результата для img2img/inpaint: пропорции исходной картинки (кратно 8, не больше MAX_EDIT_SIDE).
+    Раньше брался размер из настроек, и картинка с другими пропорциями растягивалась/сжималась.
+    """
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            width, height = img.size
+    except Exception:
+        return fallback_width, fallback_height
+    if width <= 0 or height <= 0:
+        return fallback_width, fallback_height
+    scale = min(1.0, MAX_EDIT_SIDE / max(width, height))
+    width, height = int(width * scale), int(height * scale)
+    width, height = max(64, (width // 8) * 8), max(64, (height // 8) * 8)
+    return width, height
 
 
 # ===== ВЫБОР МОДЕЛИ (CHECKPOINT) =====
@@ -105,18 +129,23 @@ def get_progress() -> dict:
             headers={'Content-Type': 'application/json'},
             method='GET'
         )
-        response = urllib.request.urlopen(request, timeout=5)
-        return json.loads(response.read().decode('utf-8'))
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return json.loads(response.read().decode('utf-8'))
     except Exception:
         return {"progress": 0, "eta_relative": 0, "state": {}}
 
 
 def generate_with_progress(
     payload: dict,
-    progress_callback: Optional[Callable[[float, float], None]] = None
+    progress_callback: Optional[Callable[[float, float], None]] = None,
+    endpoint: str = "sdapi/v1/txt2img"
 ) -> dict:
+    """
+    Отправляет запрос генерации и пока он выполняется опрашивает прогресс.
+    endpoint: "sdapi/v1/txt2img" (по умолчанию) или "sdapi/v1/img2img" — для запросов с init_images/mask.
+    """
     data = json.dumps(payload).encode('utf-8')
-    full_url = f'{SD_BASE_URL}/sdapi/v1/txt2img'
+    full_url = f'{SD_BASE_URL}/{endpoint.lstrip("/")}'
 
     request = urllib.request.Request(
         full_url,
@@ -125,14 +154,13 @@ def generate_with_progress(
         method='POST'
     )
 
-    import threading
     result_container = {}
     error_container = {}
 
     def worker():
         try:
-            response = urllib.request.urlopen(request, timeout=180)
-            result_container['response'] = json.loads(response.read().decode('utf-8'))
+            with urllib.request.urlopen(request, timeout=600) as response:
+                result_container['response'] = json.loads(response.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
             # ← ключевая строка: сохраняем ТЕЛО ошибки
             body = e.read().decode('utf-8', errors='replace')
@@ -140,7 +168,7 @@ def generate_with_progress(
         except Exception as e:
             error_container['error'] = str(e)
 
-    thread = threading.Thread(target=worker)
+    thread = threading.Thread(target=worker, daemon=True)
     thread.start()
 
     last_progress = -1
@@ -161,15 +189,17 @@ def generate_with_progress(
 
     if 'error' in error_container:
         raise Exception(error_container['error'])
+    if 'response' not in result_container:
+        raise Exception("WebUI не вернул ответ")
 
     return result_container['response']
 
 
 # ===== ПРОВЕРКА ДОСТУПНОСТИ =====
 def check_api_available() -> bool:
-    """Проверяет доступность API сервера"""
+    """Проверяет доступность API сервера (лёгкий GET-запрос; раньше здесь запускалась пробная генерация)"""
     try:
-        call_api("sdapi/v1/txt2img", prompt="test", steps=1)
+        _get_json("sdapi/v1/options", timeout=10)
         return True
     except Exception:
         return False
@@ -427,29 +457,32 @@ def enhance_prompt_for_diversity(prompt: str, user_id: str, user_settings: dict)
 
 
 def build_negative_prompt(user_id: str, custom_negative: str = None) -> str:
-    """Формирует финальный негативный промпт с учётом эмбеддингов и дополнительных анти-мутационных фраз.
-
-    Негативные эмбеддинги получаются из API WebUI (/sdapi/v1/embeddings):
-    пользователь может добавлять и удалять их через UI (настройки бота).
-    Выбор хранится в настройках ("ключ negative_embeddings") и подмешивается здесь.
-    """
+    """Формирует финальный негативный промпт: базовый текст + анти-мутационные фразы + негативные эмбеддинги."""
     use_advanced = get_use_advanced_negative(user_id)
-    
+
     if custom_negative:
         user_negative = custom_negative
     else:
         user_negative = get_user_negative_prompt(user_id)
-    
+
     # Универсальные фразы против мутаций и деформаций (если их ещё нет)
     extra_neg = "bad anatomy, extra limbs, deformed, mutated, disfigured, malformed, gross proportions, missing limbs, fused body, bad hands, bad fingers"
     if extra_neg not in user_negative:
         user_negative = f"{user_negative}, {extra_neg}"
-    
-    # Выбранные пользователем негативные эмбеддинги (из API WebUI)
-    selected_embeddings = get_user_negative_embeddings(user_id)
 
-    return get_negative_prompt_with_embeddings(user_negative, use_advanced,
-                                               selected_embeddings=selected_embeddings)
+    # Эмбеддинги: выбор пользователя (меню «Негативный промпт → Эмбеддинги») либо рекомендованные из WebUI
+    embedding_tags = effective_negative_embeddings(get_user_settings(user_id))
+    return get_negative_prompt_with_embeddings(user_negative, use_advanced, embedding_tags)
+
+
+# Отчёт ADetailer последней генерации в ТЕКУЩЕМ потоке (раньше это был общий атрибут функции,
+# который параллельные генерации перезаписывали друг у друга).
+_tls = threading.local()
+MAX_SEED = 2**32 - 1  # WebUI принимает seed только до 2^32-1
+
+
+def get_last_adetailer_status() -> Dict[str, Any]:
+    return getattr(_tls, "last_adetailer_status", {"detected": 0, "detections": [], "models": []})
 
 
 def generate_txt2img(
@@ -459,35 +492,50 @@ def generate_txt2img(
     progress_callback: Optional[Callable[[float, float], None]] = None,
     status_callback: Optional[Callable[[str], None]] = None,
     fixed_seed: int = None,
-    adetailer_overrides: Optional[dict] = None
+    adetailer_overrides: Optional[dict] = None,
+    exact_prompt: Optional[str] = None,
+    exact_negative: Optional[str] = None
 ) -> Tuple[List[io.BytesIO], int, str, str]:
     """
     Генерация изображений
     Возвращает: (images, seed, original_prompt, processed_prompt)
-    side-effect: атрибут last_adetailer_status с отчётом по ADetailer
+
+    exact_prompt / exact_negative — «точный повтор»: промпты берутся как есть (без перевода через Ollama,
+    без повторного добавления LoRA и случайных фраз разнообразия). Нужны, чтобы повтор с тем же seed
+    действительно давал ту же картинку.
+
+    Итоговые промпты, ушедшие в WebUI, сохраняются в атрибутах первого изображения
+    (image.final_prompt, image.final_negative); отчёт ADetailer — через get_last_adetailer_status()
+    (хранится отдельно для каждого потока, поэтому параллельные генерации не затирают друг друга).
     """
-    
+
     # Сохраняем оригинальный промпт
     original_prompt = prompt
-    
-    # Обрабатываем промпт через нейросеть (если включено)
-    processed_prompt = preprocess_prompt(user_id, prompt, status_callback)
-    # Добавляем активные LoRA в промпт
-    lora_tags = get_active_lora_tags(user_id)
-    if lora_tags:
-        processed_prompt = f"{processed_prompt}, {lora_tags}"
-    if status_callback:
-        status_callback("🎨 Генерация изображения...")
-    
+
+    if exact_prompt is not None:
+        processed_prompt = exact_prompt
+        enhanced_prompt = exact_prompt
+        if status_callback:
+            status_callback("🎨 Генерация изображения...")
+    else:
+        # Обрабатываем промпт через нейросеть (если включено)
+        processed_prompt = preprocess_prompt(user_id, prompt, status_callback)
+        # Добавляем активные LoRA в промпт
+        lora_tags = get_active_lora_tags(user_id)
+        if lora_tags:
+            processed_prompt = f"{processed_prompt}, {lora_tags}"
+        if status_callback:
+            status_callback("🎨 Генерация изображения...")
+        # Используем обработанный промпт для дальнейшей обработки
+        enhanced_prompt = enhance_prompt_for_diversity(processed_prompt, user_id, user_settings)
+
     # Используем фиксированный seed если передан, иначе случайный
     if fixed_seed is not None:
         seed = fixed_seed
     else:
-        seed = random.randint(1, 2**32)
-    
-    # Используем обработанный промпт для дальнейшей обработки
-    enhanced_prompt = enhance_prompt_for_diversity(processed_prompt, user_id, user_settings)
-    negative_prompt = build_negative_prompt(user_id)
+        seed = random.randint(1, MAX_SEED)
+
+    negative_prompt = exact_negative if exact_negative is not None else build_negative_prompt(user_id)
     
     # Получаем сэмплер из настроек, если он там есть
     sampler = user_settings.get("sampler_name", "Euler a")
@@ -520,18 +568,20 @@ def generate_txt2img(
 
     # Сохраняем отчёт ADetailer, чтобы бот мог показать его в капшне
     try:
-        generate_txt2img.last_adetailer_status = get_adetailer_status(response)
+        _tls.last_adetailer_status = get_adetailer_status(response)
     except Exception as e:  # pragma: no cover - диагностика не должна ломать генерацию
         print(f"⚠️ Не удалось разобрать отчёт ADetailer: {e}")
-        generate_txt2img.last_adetailer_status = {"detected": 0, "detections": [], "models": []}
+        _tls.last_adetailer_status = {"detected": 0, "detections": [], "models": []}
 
     images = []
     for index, img_base64 in enumerate(response.get('images', [])):
         image_bytes = base64.b64decode(img_base64)
         image_file = io.BytesIO(image_bytes)
         image_file.name = f"generation_{index}.png"
+        image_file.final_prompt = enhanced_prompt
+        image_file.final_negative = negative_prompt
         images.append(image_file)
-    
+
     return images, seed, original_prompt, processed_prompt
 
 
@@ -546,7 +596,12 @@ def generate_txt2img_advanced(
 ) -> Tuple[List[io.BytesIO], int]:
     """Генерация с кастомным негативным промптом"""
 
-    seed = random.randint(1, 2**32)
+    seed = random.randint(1, MAX_SEED)
+
+    # Негативные эмбеддинги пользователя добавляются и к «ручному» негативу (без дублей)
+    embedding_tags = effective_negative_embeddings(user_settings)
+    if embedding_tags:
+        negative_prompt = _merge_unique_tags(negative_prompt, ", ".join(embedding_tags))
 
     payload = {
         "prompt": prompt,
@@ -576,8 +631,10 @@ def generate_txt2img_advanced(
         image_bytes = base64.b64decode(img_base64)
         image_file = io.BytesIO(image_bytes)
         image_file.name = f"generation_{index}.png"
+        image_file.final_prompt = prompt
+        image_file.final_negative = negative_prompt
         images.append(image_file)
-    
+
     return images, seed
 
 
@@ -594,11 +651,13 @@ def swap_face_with_reactor(
     codeformer_weight: float = 0.5,
     gender_source: int = 0,
     gender_target: int = 0,
-    source_faces_index: list = [0],
-    face_index: list = [0]
+    source_faces_index: Optional[list] = None,
+    face_index: Optional[list] = None
 ) -> io.BytesIO:
     """Улучшенная замена лица с расширенными параметрами"""
-    
+    source_faces_index = [0] if source_faces_index is None else source_faces_index
+    face_index = [0] if face_index is None else face_index
+
     target_image.seek(0)
     target_base64 = base64.b64encode(target_image.read()).decode('utf-8')
     
@@ -654,13 +713,16 @@ def swap_face_with_reactor(
             return swapped_image
             
         except urllib.error.HTTPError as e:
-            error_body = e.read().decode('utf-8')
-            last_error = f"HTTP {e.code}: {error_body}"
+            error_body = e.read().decode('utf-8', errors='replace')
+            if e.code != 404:  # 404 — это просто «такого эндпоинта нет», настоящую причину не затираем
+                last_error = f"HTTP {e.code}: {error_body}"
+            elif last_error is None:
+                last_error = f"HTTP 404: эндпоинт {endpoint} не найден (установлен ли ReActor?)"
             continue
         except Exception as e:
             last_error = str(e)
             continue
-    
+
     raise Exception(f"Не удалось заменить лицо. Последняя ошибка: {last_error}")
 
 
@@ -757,19 +819,21 @@ def generate_img2img(
 ) -> List[io.BytesIO]:
     """Генерация на основе исходного изображения"""
     init_image.seek(0)
-    init_base64 = base64.b64encode(init_image.read()).decode('utf-8')
-    
+    init_bytes = init_image.read()
+    init_base64 = base64.b64encode(init_bytes).decode('utf-8')
+    width, height = fit_dims_to_image(init_bytes, user_settings.get("width", 512), user_settings.get("height", 512))
+
     payload = {
         "init_images": [init_base64],
         "prompt": prompt,
-        "negative_prompt": build_negative_prompt("default"),
+        "negative_prompt": build_negative_prompt(user_id),
         "denoising_strength": user_settings.get("denoising_strength", 0.75),
         "steps": user_settings.get("steps", 20),
-        "width": user_settings.get("width", 512),
-        "height": user_settings.get("height", 512),
+        "width": width,
+        "height": height,
         "cfg_scale": user_settings.get("cfg_scale", 7.0),
         "sampler_name": user_settings.get("sampler_name", "Euler a"),
-        "seed": random.randint(1, 2**32),
+        "seed": random.randint(1, MAX_SEED),
         "batch_size": user_settings.get("batch_size", 1),
     }
 
@@ -781,60 +845,15 @@ def generate_img2img(
         print(f"🕵️ ADetailer img2img: model={ad_block['args'][0].get('ad_model', '?')}")
 
     apply_model_override(payload, user_settings)
-    data = json.dumps(payload).encode('utf-8')
-    full_url = f'{SD_BASE_URL}/sdapi/v1/img2img'
-    
-    request = urllib.request.Request(
-        full_url,
-        headers={'Content-Type': 'application/json'},
-        data=data,
-        method='POST'
-    )
-    
-    import threading
-    result_container = {}
-    error_container = {}
-    
-    def worker():
-        try:
-            response = urllib.request.urlopen(request, timeout=180)
-            result_container['response'] = json.loads(response.read().decode('utf-8'))
-        except Exception as e:
-            error_container['error'] = str(e)
-    
-    thread = threading.Thread(target=worker)
-    thread.start()
-    
-    last_progress = -1
-    while thread.is_alive():
-        try:
-            progress_data = get_progress()
-            progress = progress_data.get('progress', 0)
-            eta = progress_data.get('eta_relative', 0)
-            
-            if int(progress * 100) > last_progress:
-                last_progress = int(progress * 100)
-                if progress_callback:
-                    progress_callback(progress, eta)
-        except Exception:
-            pass
-        
-        time.sleep(0.5)
-    
-    thread.join()
-    
-    if 'error' in error_container:
-        raise Exception(error_container['error'])
-    
-    response = result_container['response']
-    
+    response = generate_with_progress(payload, progress_callback, endpoint="sdapi/v1/img2img")
+
     images = []
     for index, img_base64 in enumerate(response.get('images', [])):
         image_bytes = base64.b64decode(img_base64)
         image_file = io.BytesIO(image_bytes)
         image_file.name = f"img2img_result_{index}.png"
         images.append(image_file)
-    
+
     return images
 
 
@@ -872,36 +891,41 @@ def generate_inpaint(
     init_image: io.BytesIO,
     mask: io.BytesIO,
     settings: dict,
-    progress_callback: Optional[Callable[[float, float], None]] = None
+    progress_callback: Optional[Callable[[float, float], None]] = None,
+    user_id: str = "default"
 ) -> io.BytesIO:
     """
     Генерация с маской (inpainting)
     mask – изображение, где белое (255) – область для перерисовки, чёрное (0) – сохраняемая область.
+
+    Запрос уходит на img2img (раньше по ошибке — на txt2img, из-за чего исходная картинка и маска игнорировались).
     """
     init_image.seek(0)
-    init_base64 = base64.b64encode(init_image.read()).decode('utf-8')
+    init_bytes = init_image.read()
+    init_base64 = base64.b64encode(init_bytes).decode('utf-8')
     mask.seek(0)
     mask_base64 = base64.b64encode(mask.read()).decode('utf-8')
+    width, height = fit_dims_to_image(init_bytes, settings.get("width", 512), settings.get("height", 512))
 
     payload = {
         "init_images": [init_base64],
         "mask": mask_base64,
         "prompt": prompt,
-        "negative_prompt": build_negative_prompt("default"),
+        "negative_prompt": build_negative_prompt(user_id),
         "denoising_strength": settings.get("denoising_strength", 0.75),
         "steps": settings.get("steps", 20),
-        "width": settings.get("width", 512),
-        "height": settings.get("height", 512),
+        "width": width,
+        "height": height,
         "cfg_scale": settings.get("cfg_scale", 7.0),
         "sampler_name": settings.get("sampler_name", "Euler a"),
-        "seed": random.randint(1, 2**32),
+        "seed": random.randint(1, MAX_SEED),
         "batch_size": 1,
         "inpainting_fill": 1,  # 1 = original, 0 = fill with color
         "mask_blur": 4,
     }
 
     apply_model_override(payload, settings)
-    response = generate_with_progress(payload, progress_callback)
+    response = generate_with_progress(payload, progress_callback, endpoint="sdapi/v1/img2img")
     images = response.get('images', [])
     if not images:
         raise Exception("API не вернул изображений")
@@ -910,6 +934,8 @@ def generate_inpaint(
     image_file = io.BytesIO(image_bytes)
     image_file.name = "inpainted.png"
     return image_file
+
+
 def get_loras_list() -> List[Dict[str, str]]:
     """Получает список доступных LoRA из API Stable Diffusion"""
     try:
@@ -949,14 +975,20 @@ def generate_image(
     user_id: str = None,
     progress_callback: Optional[Callable[[float, float], None]] = None,
     status_callback: Optional[Callable[[str], None]] = None,
-    fixed_seed: int = None
+    fixed_seed: int = None,
+    exact_prompt: Optional[str] = None,
+    exact_negative: Optional[str] = None
 ) -> Tuple[io.BytesIO, int, str, str]:
     """Генерация с возвратом изображения, seed, оригинального и обработанного промпта"""
     if user_id is None:
         user_id = "default"
-    
+
     images, seed, original_prompt, processed_prompt = generate_txt2img(
-        prompt, user_id, user_settings, progress_callback, status_callback, fixed_seed
+        prompt, user_id, user_settings, progress_callback, status_callback, fixed_seed,
+        exact_prompt=exact_prompt, exact_negative=exact_negative
     )
-    
-    return (images[0] if images else io.BytesIO()), seed, original_prompt, processed_prompt
+
+    if not images:
+        # Раньше возвращался пустой BytesIO, и бот падал позже с невнятной ошибкой отправки
+        raise Exception("WebUI не вернул изображений")
+    return images[0], seed, original_prompt, processed_prompt
