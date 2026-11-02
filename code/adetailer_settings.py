@@ -8,9 +8,12 @@ ADetailer для API (ad_model, ad_confidence, ...), чтобы его можн�
 
 По аналогии с controlnet_settings.py: файл настроек лежит в DATA_DIR.
 """
+import copy
 import json
 import os
 from typing import Any, Dict
+
+from storage import JsonStore
 
 try:
     import app_config as config
@@ -82,48 +85,48 @@ PADDING_VALUES = [0, 16, 32, 48, 64, 96, 128]
 MERGE_INVERT_VALUES = ["None", "Merge", "Merge and Invert"]
 
 
+_STORE = JsonStore(ADETAILER_SETTINGS_FILE)
+
+
 def _load_all_settings() -> dict:
     """Загружает настройки ADetailer всех пользователей"""
-    if os.path.exists(ADETAILER_SETTINGS_FILE):
-        try:
-            with open(ADETAILER_SETTINGS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+    return _STORE.read()
 
 
-def _save_all_settings(settings: dict):
-    with open(ADETAILER_SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(settings, f, indent=2, ensure_ascii=False)
-
-
-def get_adetailer_settings(user_id: str) -> Dict[str, Any]:
-    """Возвращает настройки ADetailer пользователя (с дефолтами)"""
-    all_settings = _load_all_settings()
-    user_settings = all_settings.get(user_id, {})
-
+def _fill_defaults(user_settings: dict) -> dict:
     for key, value in DEFAULT_ADETAILER_SETTINGS.items():
         if key not in user_settings:
-            user_settings[key] = value
-
-    all_settings[user_id] = user_settings
-    _save_all_settings(all_settings)
+            user_settings[key] = copy.deepcopy(value)
     return user_settings
 
 
+def get_adetailer_settings(user_id: str) -> Dict[str, Any]:
+    """Возвращает настройки ADetailer пользователя (с дефолтами); файл пишется только при изменении"""
+    user_id = str(user_id)
+
+    def mutator(all_settings: dict):
+        user_settings = _fill_defaults(all_settings.get(user_id, {}))
+        all_settings[user_id] = user_settings
+        return copy.deepcopy(user_settings)
+
+    return _STORE.update(mutator)
+
+
 def save_adetailer_settings(user_id: str, settings: Dict[str, Any]):
-    """Сохраняет настройки ADetailer пользователя"""
-    all_settings = _load_all_settings()
-    all_settings[user_id] = settings
-    _save_all_settings(all_settings)
+    """Сохраняет настройки ADetailer пользователя (замена целиком)"""
+    _STORE.update(lambda all_settings: all_settings.__setitem__(str(user_id), copy.deepcopy(settings)))
 
 
 def set_adetailer_setting(user_id: str, key: str, value: Any):
-    """Устанавливает отдельную настройку"""
-    settings = get_adetailer_settings(user_id)
-    settings[key] = value
-    save_adetailer_settings(user_id, settings)
+    """Устанавливает отдельную настройку (атомарно)"""
+    user_id = str(user_id)
+
+    def mutator(all_settings: dict):
+        user_settings = _fill_defaults(all_settings.get(user_id, {}))
+        user_settings[key] = value
+        all_settings[user_id] = user_settings
+
+    _STORE.update(mutator)
 
 
 def get_adetailer_enabled(user_id: str) -> bool:
