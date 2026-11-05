@@ -1,3 +1,4 @@
+import asyncio
 import os
 import io
 import re
@@ -6,15 +7,14 @@ import base64
 import json
 import random
 import time
-import urllib.request
-import urllib.error
-from typing import Optional, Callable, List, Dict, Any
+from typing import Awaitable, Optional, Callable, List, Dict, Any
+from aio import LazyLock
 from settings import get_active_lora_tags
 
 import pandas as pd
 
 # Импортируем общие утилиты из Aapi (прогресс, негативный промпт)
-from Aapi import generate_with_progress, build_negative_prompt, apply_model_override, fit_dims_to_image, MAX_SEED
+from Aapi import generate_with_progress, build_negative_prompt, apply_model_override, fit_dims_to_image, MAX_SEED, _b64encode, decode_base64_to_bytes
 
 # ===== КОНФИГУРАЦИЯ =====
 CONTROLNET_IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "controlnet_images")
@@ -97,7 +97,7 @@ def _load_parquet_item(filename: str, index: int, col: str) -> Optional[io.Bytes
     return None
 
 
-def get_controlnet_sources() -> List[Dict[str, Any]]:
+def _get_controlnet_sources_sync() -> List[Dict[str, Any]]:
     """
     Сканирует папку controlnet_images:
     - рекурсивно ищет все *bone_structure.png (или .jpg)
@@ -213,7 +213,7 @@ def get_controlnet_sources() -> List[Dict[str, Any]]:
     return sources
 
 
-def get_controlnet_preview_by_source(source: Dict[str, Any]) -> Optional[io.BytesIO]:
+def _get_controlnet_preview_sync(source: Dict[str, Any]) -> Optional[io.BytesIO]:
     """Возвращает BytesIO с изображением для источника"""
     try:
         if source['type'] == 'parquet':
@@ -245,9 +245,31 @@ def get_controlnet_preview_by_source(source: Dict[str, Any]) -> Optional[io.Byte
     return None
 
 
+# ===== АСИНХРОННЫЙ ДОСТУП К ДАННЫМ (тяжёлое чтение parquet/папок — в потоке) =====
+_sources_cache: Optional[List[Dict[str, Any]]] = None
+_sources_lock = LazyLock()
+
+
+async def get_controlnet_sources(force_refresh: bool = False) -> List[Dict[str, Any]]:
+    """
+    Список источников ControlNet. Индекс (os.walk + чтение parquet) строится ОДИН раз в потоке
+    (при старте бота) и дальше берётся из кэша; force_refresh=True — пересобрать.
+    """
+    global _sources_cache
+    async with _sources_lock:
+        if force_refresh or _sources_cache is None:
+            _sources_cache = await asyncio.to_thread(_get_controlnet_sources_sync)
+        return list(_sources_cache)
+
+
+async def get_controlnet_preview_by_source(source: Dict[str, Any]) -> Optional[io.BytesIO]:
+    """Изображение источника (выборка из parquet/файла — в потоке)."""
+    return await asyncio.to_thread(_get_controlnet_preview_sync, source)
+
+
 # ===== ГЕНЕРАЦИЯ С CONTROLNET =====
 
-def generate_controlnet(
+async def generate_controlnet(
     prompt: str,
     init_image: io.BytesIO,
     control_image: io.BytesIO,
@@ -265,14 +287,14 @@ def generate_controlnet(
     init_bytes = init_image.read()
     if not init_bytes:
         raise Exception("init_image пуст")
-    init_base64 = base64.b64encode(init_bytes).decode('utf-8')
+    init_base64 = await _b64encode(init_bytes)
 
-    # --- Валидация control_image ---
+    # --- Валидация control_image (PIL — CPU-работа, уходит в поток) ---
     try:
-        control_bytes = _validate_control_image(control_image)
+        control_bytes = await asyncio.to_thread(_validate_control_image, control_image)
     except ValueError as e:
         raise Exception(f"ControlNet: {e}")
-    control_base64 = base64.b64encode(control_bytes).decode('utf-8')
+    control_base64 = await _b64encode(control_bytes)
 
     # --- Валидация размеров: результат повторяет пропорции исходной картинки ---
     w, h = _safe_dims(settings)
@@ -297,7 +319,7 @@ def generate_controlnet(
     payload = {
         "init_images": [init_base64],
         "prompt": prompt,
-        "negative_prompt": build_negative_prompt(user_id),
+        "negative_prompt": await build_negative_prompt(user_id),
         "denoising_strength": settings.get("denoising_strength", 0.7),
         "steps": settings.get("steps", 20),
         "width": w,
@@ -321,18 +343,18 @@ def generate_controlnet(
 
     apply_model_override(payload, settings)
     # img2img-запрос должен идти на img2img (раньше по ошибке — на txt2img, и init_images игнорировались)
-    response = generate_with_progress(payload, progress_callback, endpoint="sdapi/v1/img2img")
+    response = await generate_with_progress(payload, progress_callback, endpoint="sdapi/v1/img2img")
     images = response.get('images', [])
     if not images:
         raise Exception("API не вернул изображений")
     img_base64 = images[0]
-    image_bytes = base64.b64decode(img_base64)
+    image_bytes = await asyncio.to_thread(decode_base64_to_bytes, img_base64)
     image_file = io.BytesIO(image_bytes)
     image_file.name = "controlnet.png"
     return image_file
 
 
-def generate_txt2img_controlnet(
+async def generate_txt2img_controlnet(
     prompt: str,
     control_image: io.BytesIO,
     module: str,
@@ -345,18 +367,18 @@ def generate_txt2img_controlnet(
     """
     Генерация txt2img с ControlNet (без исходного изображения).
     """
-    lora_tags = get_active_lora_tags(user_id)
+    lora_tags = await get_active_lora_tags(user_id)
     if lora_tags:
         prompt = f"{prompt}, {lora_tags}"
         if status_callback:
-            status_callback(f"🎛️ Добавлены LoRA: {lora_tags}")
+            await status_callback(f"🎛️ Добавлены LoRA: {lora_tags}")
 
     # --- Валидация control_image ---
     try:
-        control_bytes = _validate_control_image(control_image)
+        control_bytes = await asyncio.to_thread(_validate_control_image, control_image)
     except ValueError as e:
         raise Exception(f"ControlNet: {e}")
-    control_base64 = base64.b64encode(control_bytes).decode('utf-8')
+    control_base64 = await _b64encode(control_bytes)
 
     # --- Валидация размеров ---
     w, h = _safe_dims(settings)
@@ -384,7 +406,7 @@ def generate_txt2img_controlnet(
     seed = random.randint(1, MAX_SEED)
     payload = {
         "prompt": prompt,
-        "negative_prompt": build_negative_prompt(user_id),
+        "negative_prompt": await build_negative_prompt(user_id),
         "steps": settings.get("steps", 40),
         "width": w,
         "height": h,
@@ -409,12 +431,12 @@ def generate_txt2img_controlnet(
     )
 
     apply_model_override(payload, settings)
-    response = generate_with_progress(payload, progress_callback)
+    response = await generate_with_progress(payload, progress_callback)
     images = response.get('images', [])
     if not images:
         raise Exception("API не вернул изображений")
     img_base64 = images[0]
-    image_bytes = base64.b64decode(img_base64)
+    image_bytes = await asyncio.to_thread(decode_base64_to_bytes, img_base64)
     image_file = io.BytesIO(image_bytes)
     image_file.name = "controlnet_txt2img.png"
     image_file.seed = seed  # main.py показывает seed в подписи

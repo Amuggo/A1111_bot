@@ -29,9 +29,9 @@ DEFAULT_CONTROLNET_SETTINGS = {
 _STORE = JsonStore(CONTROLNET_SETTINGS_FILE)
 
 
-def _load_all_settings() -> dict:
+async def _load_all_settings() -> dict:
     """Загружает все настройки ControlNet пользователей"""
-    return _STORE.read()
+    return await _STORE.aread()
 
 
 def _fill_defaults(user_settings: dict) -> dict:
@@ -42,7 +42,7 @@ def _fill_defaults(user_settings: dict) -> dict:
     return user_settings
 
 
-def get_controlnet_settings(user_id: str) -> Dict[str, Any]:
+async def get_controlnet_settings(user_id: str) -> Dict[str, Any]:
     """Возвращает настройки ControlNet для пользователя (файл пишется только при изменении)"""
     user_id = str(user_id)
 
@@ -51,15 +51,15 @@ def get_controlnet_settings(user_id: str) -> Dict[str, Any]:
         all_settings[user_id] = user_settings
         return copy.deepcopy(user_settings)
 
-    return _STORE.update(mutator)
+    return await _STORE.aupdate(mutator)
 
 
-def save_controlnet_settings(user_id: str, settings: Dict[str, Any]):
+async def save_controlnet_settings(user_id: str, settings: Dict[str, Any]):
     """Сохраняет настройки ControlNet для пользователя (замена целиком)"""
-    _STORE.update(lambda all_settings: all_settings.__setitem__(str(user_id), copy.deepcopy(settings)))
+    await _STORE.aupdate(lambda all_settings: all_settings.__setitem__(str(user_id), copy.deepcopy(settings)))
 
 
-def set_controlnet_setting(user_id: str, key: str, value: Any):
+async def set_controlnet_setting(user_id: str, key: str, value: Any):
     """Устанавливает конкретную настройку (атомарно)"""
     user_id = str(user_id)
 
@@ -68,7 +68,7 @@ def set_controlnet_setting(user_id: str, key: str, value: Any):
         user_settings[key] = value
         all_settings[user_id] = user_settings
 
-    _STORE.update(mutator)
+    await _STORE.aupdate(mutator)
 
 
 # Расшифровка значений для отображения

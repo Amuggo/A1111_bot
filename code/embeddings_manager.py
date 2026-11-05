@@ -1,5 +1,9 @@
 import os
-import urllib.request
+import asyncio
+
+import aiohttp
+
+import http_client
 import zipfile
 import shutil
 from pathlib import Path
@@ -65,25 +69,32 @@ def check_embeddings_installed() -> dict:
     return result
 
 
-def download_embedding(embedding_name: str, progress_callback=None) -> bool:
-    """Скачивает эмбеддинг"""
+async def download_embedding(embedding_name: str, progress_callback=None) -> bool:
+    """Скачивает эмбеддинг (aiohttp; запись файла — в потоке)"""
     if embedding_name not in RECOMMENDED_EMBEDDINGS:
         return False
-    
+
     info = RECOMMENDED_EMBEDDINGS[embedding_name]
     file_path = os.path.join(EMBEDDINGS_PATH, info["filename"])
-    
-    try:
+
+    def write_file(data: bytes) -> None:
         os.makedirs(EMBEDDINGS_PATH, exist_ok=True)
-        
+        with open(file_path, "wb") as f:
+            f.write(data)
+
+    try:
         if progress_callback:
             progress_callback(f"Скачиваю {info['filename']}...")
-        
-        urllib.request.urlretrieve(info["url"], file_path)
-        
+
+        session = await http_client.get_session()
+        async with session.get(info["url"], timeout=aiohttp.ClientTimeout(total=600)) as resp:
+            resp.raise_for_status()
+            data = await resp.read()
+        await asyncio.to_thread(write_file, data)
+
         if progress_callback:
             progress_callback(f"✅ {info['filename']} установлен!")
-        
+
         return True
     except Exception as e:
         if progress_callback:
@@ -91,15 +102,15 @@ def download_embedding(embedding_name: str, progress_callback=None) -> bool:
         return False
 
 
-def install_all_recommended_embeddings(progress_callback=None) -> dict:
+async def install_all_recommended_embeddings(progress_callback=None) -> dict:
     """Устанавливает все рекомендуемые эмбеддинги"""
     results = {}
-    
+
     for name in RECOMMENDED_EMBEDDINGS:
         if progress_callback:
             progress_callback(f"Устанавливаю {name}...")
-        results[name] = download_embedding(name, progress_callback)
-    
+        results[name] = await download_embedding(name, progress_callback)
+
     return results
 
 

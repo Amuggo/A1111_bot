@@ -1,3 +1,4 @@
+import bootstrap_env  # noqa: F401,E402  — ДОЛЖЕН идти первым: переключает скрипт на библиотеки из папки env/
 import os
 import pandas as pd
 import numpy as np

@@ -3,6 +3,7 @@
 Все данные сохраняются локально
 """
 
+import asyncio
 import os
 import io
 import threading
@@ -33,12 +34,12 @@ def _face_path(user_id: str, face_name: str) -> str:
     return os.path.join(FACES_DIR, str(user_id), f"{face_name}.jpg")
 
 
-def load_face_settings() -> dict:
+def _load_face_settings_sync() -> dict:
     """Загружает настройки лиц всех пользователей"""
     return _FACE_STORE.read()
 
 
-def save_face_settings(settings: dict):
+def _save_face_settings_sync(settings: dict):
     """Полностью заменяет настройки лиц (оставлено для совместимости; для правок используйте _update_user_face_settings)."""
     _FACE_STORE.write(settings)
 
@@ -56,24 +57,24 @@ def _update_user_face_settings(user_id: str, mutator):
     return _FACE_STORE.update(_mutator)
 
 
-def get_face_enabled(user_id: str) -> bool:
+def _get_face_enabled_sync(user_id: str) -> bool:
     """Получает статус включения замены лиц для пользователя"""
     return bool(_update_user_face_settings(user_id, lambda entry: entry.get("face_enabled", False)))
 
 
-def set_face_enabled(user_id: str, enabled: bool):
+def _set_face_enabled_sync(user_id: str, enabled: bool):
     """Устанавливает статус включения замены лиц"""
     _update_user_face_settings(user_id, lambda entry: entry.__setitem__("face_enabled", bool(enabled)))
 
 
-def get_active_face_name(user_id: str) -> Optional[str]:
+def _get_active_face_name_sync(user_id: str) -> Optional[str]:
     """Получает имя активного лица пользователя"""
-    return load_face_settings().get(str(user_id), {}).get("active_face")
+    return _load_face_settings_sync().get(str(user_id), {}).get("active_face")
 
 
-def get_active_face(user_id: str) -> Optional[io.BytesIO]:
+def _get_active_face_sync(user_id: str) -> Optional[io.BytesIO]:
     """Получает активное лицо пользователя как BytesIO"""
-    active_face_name = get_active_face_name(user_id)
+    active_face_name = _get_active_face_name_sync(user_id)
 
     if active_face_name:
         try:
@@ -87,7 +88,7 @@ def get_active_face(user_id: str) -> Optional[io.BytesIO]:
     return None
 
 
-def set_active_face(user_id: str, face_name: str) -> bool:
+def _set_active_face_sync(user_id: str, face_name: str) -> bool:
     """Устанавливает активное лицо"""
     try:
         face_path = _face_path(user_id, face_name)
@@ -100,12 +101,12 @@ def set_active_face(user_id: str, face_name: str) -> bool:
         return True
 
 
-def get_user_faces(user_id: str) -> List[Dict]:
+def _get_user_faces_sync(user_id: str) -> List[Dict]:
     """Получает список лиц пользователя с их статусами"""
     user_dir = os.path.join(FACES_DIR, str(user_id))
     faces = []
 
-    active_face_name = get_active_face_name(user_id)
+    active_face_name = _get_active_face_name_sync(user_id)
 
     if os.path.exists(user_dir):
         for filename in sorted(os.listdir(user_dir)):
@@ -119,7 +120,7 @@ def get_user_faces(user_id: str) -> List[Dict]:
     return faces
 
 
-def save_user_face(user_id: str, image: io.BytesIO, face_name: str) -> bool:
+def _save_user_face_sync(user_id: str, image: io.BytesIO, face_name: str) -> bool:
     """Сохраняет лицо пользователя"""
     try:
         face_path = _face_path(user_id, face_name)  # проверка имени (без ../ и т.п.)
@@ -137,7 +138,7 @@ def save_user_face(user_id: str, image: io.BytesIO, face_name: str) -> bool:
         return False
 
 
-def delete_face(user_id: str, face_name: str) -> bool:
+def _delete_face_sync(user_id: str, face_name: str) -> bool:
     """Удаляет лицо пользователя"""
     try:
         face_path = _face_path(user_id, face_name)
@@ -158,7 +159,7 @@ def delete_face(user_id: str, face_name: str) -> bool:
         return False
 
 
-def rename_face(user_id: str, old_name: str, new_name: str) -> bool:
+def _rename_face_sync(user_id: str, old_name: str, new_name: str) -> bool:
     """Переименовывает лицо"""
     try:
         old_path = _face_path(user_id, old_name)
@@ -181,7 +182,7 @@ def rename_face(user_id: str, old_name: str, new_name: str) -> bool:
         return False
 
 
-def get_face_preview(user_id: str, face_name: str) -> Optional[io.BytesIO]:
+def _get_face_preview_sync(user_id: str, face_name: str) -> Optional[io.BytesIO]:
     """Возвращает превью лица"""
     try:
         face_path = _face_path(user_id, face_name)
@@ -194,9 +195,9 @@ def get_face_preview(user_id: str, face_name: str) -> Optional[io.BytesIO]:
     return None
 
 
-def get_face_stats(user_id: str) -> dict:
+def _get_face_stats_sync(user_id: str) -> dict:
     """Возвращает статистику по лицам пользователя"""
-    faces = get_user_faces(user_id)
+    faces = _get_user_faces_sync(user_id)
     active_face = next((f for f in faces if f["is_active"]), None)
     
     return {
@@ -205,10 +206,51 @@ def get_face_stats(user_id: str) -> dict:
     }
 
 
-def check_reactor_available() -> bool:
+# ===== Асинхронный интерфейс: файловый ввод-вывод выполняется в потоке (to_thread), цикл событий не блокируется =====
+
+async def load_face_settings() -> dict:
+    return await asyncio.to_thread(_load_face_settings_sync, )
+
+async def save_face_settings(settings: dict):
+    return await asyncio.to_thread(_save_face_settings_sync, settings)
+
+async def get_face_enabled(user_id: str) -> bool:
+    return await asyncio.to_thread(_get_face_enabled_sync, user_id)
+
+async def set_face_enabled(user_id: str, enabled: bool):
+    return await asyncio.to_thread(_set_face_enabled_sync, user_id, enabled)
+
+async def get_active_face_name(user_id: str) -> Optional[str]:
+    return await asyncio.to_thread(_get_active_face_name_sync, user_id)
+
+async def get_active_face(user_id: str) -> Optional[io.BytesIO]:
+    return await asyncio.to_thread(_get_active_face_sync, user_id)
+
+async def set_active_face(user_id: str, face_name: str) -> bool:
+    return await asyncio.to_thread(_set_active_face_sync, user_id, face_name)
+
+async def get_user_faces(user_id: str) -> List[Dict]:
+    return await asyncio.to_thread(_get_user_faces_sync, user_id)
+
+async def save_user_face(user_id: str, image: io.BytesIO, face_name: str) -> bool:
+    return await asyncio.to_thread(_save_user_face_sync, user_id, image, face_name)
+
+async def delete_face(user_id: str, face_name: str) -> bool:
+    return await asyncio.to_thread(_delete_face_sync, user_id, face_name)
+
+async def rename_face(user_id: str, old_name: str, new_name: str) -> bool:
+    return await asyncio.to_thread(_rename_face_sync, user_id, old_name, new_name)
+
+async def get_face_preview(user_id: str, face_name: str) -> Optional[io.BytesIO]:
+    return await asyncio.to_thread(_get_face_preview_sync, user_id, face_name)
+
+async def get_face_stats(user_id: str) -> dict:
+    return await asyncio.to_thread(_get_face_stats_sync, user_id)
+
+async def check_reactor_available() -> bool:
     """Проверяет доступность Reactor API"""
     try:
         from Aapi import check_reactor_available as check
-        return check()
-    except:
+        return await check()
+    except Exception:
         return False

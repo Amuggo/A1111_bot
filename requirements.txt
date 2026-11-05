@@ -1,17 +1,14 @@
-# Основные зависимости
-pyTelegramBotAPI>=4.14.0    # telebot — Telegram-бот
-requests>=2.31.0            # HTTP-клиент (Ollama, SD API)
-pandas>=2.0.0               # работа с Parquet-файлами поз ControlNet
-Pillow>=10.0.0              # обработка изображений
+# Telegram и HTTP (асинхронный стек)
+aiogram>=3.13
+aiohttp>=3.9
 
-# Работа с переменными окружения (.env)
+# Данные и изображения
 python-dotenv>=1.0.0
-
-# Опционально: сегментация, позы и редактирование изображений
-# (без них бот работает, но функции инпейнта/поз недоступны)
-opencv-python-headless>=4.8.0
-mediapipe>=0.10.0
+pandas>=2.0.0
+pyarrow>=14.0.0
+Pillow>=10.0.0
 numpy>=1.24.0
 
-# Опционально: чтение Parquet-файлов поз (если используется engine pyarrow)
-pyarrow>=14.0.0
+# Сегментация и поза (редактирование тела/одежды/фона/позы)
+opencv-python>=4.8.0
+mediapipe>=0.10.0

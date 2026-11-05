@@ -25,6 +25,7 @@
 
 Модуль потокобезопасен и никогда не роняет основной процесс: ошибки логируются в stderr.
 """
+import asyncio
 import json
 import os
 import threading
@@ -47,7 +48,7 @@ _user_names = {}
 
 
 def remember_user(user) -> None:
-    """Запоминает имя пользователя Telegram (объект telebot.types.User) для логов."""
+    """Запоминает имя пользователя Telegram (объект aiogram.types.User) для логов."""
     try:
         if user is None:
             return
@@ -93,7 +94,7 @@ def _write(record: dict) -> None:
             print(f"⚠️ Не удалось записать в лог промптов: {error}")
 
 
-def log_request(user_id, gen_type: str, original_prompt: str, processed_prompt: str = None,
+async def log_request(user_id, gen_type: str, original_prompt: str, processed_prompt: str = None,
                 settings: dict = None, negative_prompt: str = None, gen_id: str = None, **extra) -> str:
     """Пишет событие запроса на генерацию. Возвращает gen_id для последующей связи с результатом."""
     if not ENABLED:
@@ -118,11 +119,11 @@ def log_request(user_id, gen_type: str, original_prompt: str, processed_prompt: 
             if settings.get(k) is not None
         }
     record.update(extra)
-    _write(record)
+    await asyncio.to_thread(_write, record)
     return record["gen_id"]
 
 
-def log_result(gen_id: str, user_id, gen_type: str, original_prompt: str, processed_prompt: str = None,
+async def log_result(gen_id: str, user_id, gen_type: str, original_prompt: str, processed_prompt: str = None,
                seed=None, settings: dict = None, duration_sec: float = None, face_replaced: bool = None, **extra) -> None:
     """Пишет успешное завершение генерации."""
     if not ENABLED:
@@ -145,14 +146,14 @@ def log_result(gen_id: str, user_id, gen_type: str, original_prompt: str, proces
     if face_replaced is not None:
         record["face_replaced"] = face_replaced
     record.update(extra)
-    _write(record)
+    await asyncio.to_thread(_write, record)
 
 
-def log_error(gen_id: str, user_id, gen_type: str, original_prompt: str, error, duration_sec: float = None) -> None:
+async def log_error(gen_id: str, user_id, gen_type: str, original_prompt: str, error, duration_sec: float = None) -> None:
     """Пишет ошибку генерации."""
     if not ENABLED:
         return
-    _write({
+    await asyncio.to_thread(_write, {
         "event": "error",
         "gen_id": gen_id,
         "user_id": str(user_id),
@@ -163,7 +164,7 @@ def log_error(gen_id: str, user_id, gen_type: str, original_prompt: str, error, 
     })
 
 
-def tail(limit: int = 10) -> list:
+def _tail_sync(limit: int = 10) -> list:
     """Возвращает последние N записей лога (для команды /logstats или отладки)."""
     if not os.path.isfile(LOG_FILE):
         return []
@@ -173,3 +174,8 @@ def tail(limit: int = 10) -> list:
         return [json.loads(line) for line in lines if line.strip()]
     except Exception:
         return []
+
+
+async def tail(limit: int = 10) -> list:
+    """Последние записи лога (чтение файла — в потоке, цикл событий не блокируется)."""
+    return await asyncio.to_thread(_tail_sync, limit)

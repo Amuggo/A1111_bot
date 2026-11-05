@@ -117,3 +117,38 @@ PROMPT_LOG_FILE = os.path.join(DATA_DIR, get_env("PROMPT_LOG_FILE_NAME", "prompt
 
 # ===== Логирование промптов =====
 PROMPT_LOG_ENABLED = get_env("PROMPT_LOG_ENABLED", "1") not in ("0", "false", "no")
+
+
+# ===== Асинхронный стек (aiogram + aiohttp) =====
+def _get_int(name: str, default: int, minimum: int = 0) -> int:
+    """Целое число из окружения; при мусоре/слишком малом значении — значение по умолчанию/минимум."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return max(minimum, int(float(str(raw).strip())))
+    except ValueError:
+        print(f"⚠️ {name}={raw!r} не число — использую {default}", file=sys.stderr)
+        return default
+
+
+# Очередь задач генерации
+QUEUE_WORKERS = _get_int("QUEUE_WORKERS", 2, minimum=1)          # сколько задач обрабатывается одновременно
+QUEUE_MAXSIZE = _get_int("QUEUE_MAXSIZE", 50, minimum=1)         # максимум ожидающих задач
+QUEUE_MAX_PER_USER = _get_int("QUEUE_MAX_PER_USER", 3, minimum=1)  # активных задач на одного пользователя
+# Сколько одновременных запросов бот шлёт в WebUI. WebUI сам выполняет генерации строго по одной (очередь внутри
+# сервера), поэтому по умолчанию 1: так «Отменить» гарантированно прерывает именно ту задачу, что сейчас считается.
+SD_MAX_PARALLEL = _get_int("SD_MAX_PARALLEL", 1, minimum=1)
+
+# Telegram: режим работы
+BOT_MODE = get_env("BOT_MODE", "polling").strip().lower()        # polling | webhook
+POLLING_TIMEOUT = _get_int("POLLING_TIMEOUT", 10, minimum=1)     # long polling, секунд
+WEBHOOK_URL = (get_env("WEBHOOK_URL", "") or "").rstrip("/")     # https://example.com  (без пути)
+WEBHOOK_SECRET = get_env("WEBHOOK_SECRET", None) or get_env("SECRET_TOKEN", None)
+WEBHOOK_PATH = "/" + (get_env("WEBHOOK_PATH", "/webhook") or "/webhook").strip("/")
+WEBAPP_HOST = get_env("WEBAPP_HOST", "0.0.0.0")
+WEBAPP_PORT = _get_int("WEBAPP_PORT", 8080, minimum=1)
+
+# HTTP-клиент (aiohttp). total не ограничиваем: генерация может идти минуты; ограничиваем только паузу без данных.
+HTTP_SOCK_READ_TIMEOUT = _get_int("HTTP_SOCK_READ_TIMEOUT", 300, minimum=10)
+HTTP_SOCK_CONNECT_TIMEOUT = _get_int("HTTP_SOCK_CONNECT_TIMEOUT", 10, minimum=1)

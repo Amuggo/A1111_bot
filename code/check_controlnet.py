@@ -1,8 +1,9 @@
+import bootstrap_env  # noqa: F401,E402  — ДОЛЖЕН идти первым: переключает скрипт на библиотеки из папки env/
 # check_controlnet.py
 import os, io, json, base64, urllib.request, urllib.error
 from controlnet_manager import (
-    get_controlnet_sources,
-    get_controlnet_preview_by_source,
+    _get_controlnet_sources_sync as get_controlnet_sources,          # автономный синхронный скрипт
+    _get_controlnet_preview_sync as get_controlnet_preview_by_source,
     CONTROLNET_IMAGES_DIR,
 )
 

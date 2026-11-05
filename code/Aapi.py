@@ -1,18 +1,24 @@
+import asyncio
 import base64
+import contextvars
 import io
+import logging
 import re
 import json
 import random
 import time
-import threading
-import urllib.request
-import urllib.error
-from typing import Dict, List, Optional, Callable, Tuple, Any
+from typing import Awaitable, Dict, List, Optional, Callable, Tuple, Any
+
+import aiohttp
+
+from http_client import SDError, get_session, make_timeout, sd_gate, sd_get_json, sd_post_json
 
 # Импорт из settings и embeddings_manager
-from settings import get_user_negative_prompt, get_diversity_mode, get_use_advanced_negative, get_prompt_processing_enabled, get_active_lora_tags, resolve_model, get_user_settings, effective_negative_embeddings
+from settings import get_user_negative_prompt, get_diversity_mode, get_use_advanced_negative, get_prompt_processing_enabled, get_active_lora_tags, resolve_model, get_user_settings, effective_negative_embeddings, hires_plan
 from embeddings_manager import get_negative_prompt_with_embeddings, _merge_unique_tags
 from prompt_processor import fast_process
+
+log = logging.getLogger(__name__)
 
 # ===== КОНФИГУРАЦИЯ =====
 try:
@@ -32,49 +38,37 @@ except ImportError:  # pragma: no cover
     get_adetailer_enabled = None
 
 
+# ===== BASE64: чистые утилиты (CPU-лёгкие) и обёртки для больших изображений =====
+def decode_base64_to_bytes(data: str) -> bytes:
+    """Чистая синхронная утилита: base64-строка → bytes (картинки из ответов WebUI)."""
+    return base64.b64decode(data)
+
+
+def encode_bytes_to_base64(data: bytes) -> str:
+    """Чистая синхронная утилита: bytes → base64-строка."""
+    return base64.b64encode(data).decode('utf-8')
+
+
+async def _b64encode(data: bytes) -> str:
+    """Кодирование в base64 в потоке: для больших изображений это заметная CPU-работа, цикл событий не блокируем."""
+    return await asyncio.to_thread(encode_bytes_to_base64, data)
+
+
 # ===== БАЗОВЫЕ HTTP-ХЕЛПЕРЫ =====
-def _get_json(endpoint: str, timeout: int = 10):
+async def _get_json(endpoint: str, timeout: int = 10):
     """GET-запрос к API с разбором JSON"""
-    request = urllib.request.Request(
-        f'{SD_BASE_URL}/{endpoint.lstrip("/")}',
-        headers={'Content-Type': 'application/json'},
-        method='GET'
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode('utf-8'))
+    return await sd_get_json(endpoint, timeout=timeout)
 
 
-def _post_json(endpoint: str, payload: dict, timeout: int = 30):
+async def _post_json(endpoint: str, payload: dict, timeout: int = 30):
     """POST-запрос к API с JSON-телом"""
-    request = urllib.request.Request(
-        f'{SD_BASE_URL}/{endpoint.lstrip("/")}',
-        headers={'Content-Type': 'application/json'},
-        data=json.dumps(payload).encode('utf-8'),
-        method='POST'
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode('utf-8'))
+    return await sd_post_json(endpoint, payload, timeout=timeout)
 
 
 # ===== БАЗОВАЯ ФУНКЦИЯ ЗАПРОСА К API =====
-def call_api(api_endpoint: str, **payload) -> dict:
-    """Универсальная функция вызова API"""
-    data = json.dumps(payload).encode('utf-8')
-    full_url = f'{SD_BASE_URL}/{api_endpoint}'
-    
-    request = urllib.request.Request(
-        full_url,
-        headers={'Content-Type': 'application/json'},
-        data=data,
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            return json.loads(response.read().decode('utf-8'))
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode('utf-8', errors='replace')
-        raise Exception(f"HTTP {e.code}: {error_body}")
-    except urllib.error.URLError as e:
-        raise Exception(f"URL Error: {e.reason}")
+async def call_api(api_endpoint: str, **payload) -> dict:
+    """Универсальная функция вызова API (долгий запрос: без общего таймаута, пауза без данных ≤ HTTP_SOCK_READ_TIMEOUT)"""
+    return await sd_post_json(api_endpoint, payload)
 
 
 # ===== РАЗМЕР ВЫХОДА ДЛЯ img2img / inpaint =====
@@ -100,15 +94,30 @@ def fit_dims_to_image(image_bytes: bytes, fallback_width: int, fallback_height: 
     return width, height
 
 
+# ===== HIRES. FIX =====
+def apply_hires(payload: dict, settings: dict) -> dict:
+    """Включает двухпроходную генерацию (hires fix), если она включена у пользователя и укладывается в лимит VRAM."""
+    plan = hires_plan(settings)
+    if plan:
+        payload.update({
+            "enable_hr": True,
+            "hr_scale": plan["scale"],
+            "hr_upscaler": plan["upscaler"],
+            "hr_second_pass_steps": plan["steps"],
+            "denoising_strength": plan["denoise"],  # в txt2img это денойз именно второго прохода
+        })
+    return payload
+
+
 # ===== ВЫБОР МОДЕЛИ (CHECKPOINT) =====
-def apply_model_override(payload: dict, settings: dict) -> dict:
+async def apply_model_override(payload: dict, settings: dict) -> dict:
     """
     Добавляет в payload модель пользователя (или модель по умолчанию) через override_settings.
     override_settings_restore_afterwards=False — модель остаётся загруженной, поэтому
     повторные генерации с той же моделью не перезагружают её.
     """
     try:
-        model = resolve_model(settings)
+        model = await resolve_model(settings)
     except Exception as e:  # выбор модели не должен ломать генерацию
         print(f"⚠️ Не удалось определить модель: {e}")
         return payload
@@ -121,85 +130,74 @@ def apply_model_override(payload: dict, settings: dict) -> dict:
 
 
 # ===== ФУНКЦИЯ ДЛЯ ОТСЛЕЖИВАНИЯ ПРОГРЕССА =====
-def get_progress() -> dict:
+async def get_progress() -> dict:
     """Возвращает текущий прогресс генерации"""
     try:
-        request = urllib.request.Request(
-            f'{SD_BASE_URL}/sdapi/v1/progress',
-            headers={'Content-Type': 'application/json'},
-            method='GET'
-        )
-        with urllib.request.urlopen(request, timeout=5) as response:
-            return json.loads(response.read().decode('utf-8'))
+        return await sd_get_json("sdapi/v1/progress", timeout=5)
     except Exception:
         return {"progress": 0, "eta_relative": 0, "state": {}}
 
 
-def generate_with_progress(
+PROGRESS_POLL_INTERVAL = 1.0  # как часто опрашиваем /sdapi/v1/progress, секунд
+
+# Коллбэк прогресса: async (progress: 0..1, eta_seconds, state: dict с sampling_step/sampling_steps)
+ProgressCallback = Callable[..., Awaitable[None]]
+
+
+async def generate_with_progress(
     payload: dict,
-    progress_callback: Optional[Callable[[float, float], None]] = None,
+    progress_callback: Optional[ProgressCallback] = None,
     endpoint: str = "sdapi/v1/txt2img"
 ) -> dict:
     """
     Отправляет запрос генерации и пока он выполняется опрашивает прогресс.
     endpoint: "sdapi/v1/txt2img" (по умолчанию) или "sdapi/v1/img2img" — для запросов с init_images/mask.
+
+    Всё неблокирующее: сам запрос идёт отдельной asyncio-задачей, а цикл событий свободен для других
+    пользователей. При отмене (CancelledError) запрос закрывается; прерывание самой генерации в WebUI
+    (/sdapi/v1/interrupt) делает вызывающая сторона — см. task_queue.
     """
-    data = json.dumps(payload).encode('utf-8')
-    full_url = f'{SD_BASE_URL}/{endpoint.lstrip("/")}'
-
-    request = urllib.request.Request(
-        full_url,
-        headers={'Content-Type': 'application/json'},
-        data=data,
-        method='POST'
-    )
-
-    result_container = {}
-    error_container = {}
-
-    def worker():
+    async with sd_gate.slot():  # WebUI считает по одной генерации; ожидание места не блокирует цикл
+        request_task = asyncio.create_task(sd_post_json(endpoint, payload))
+        last_key = None
         try:
-            with urllib.request.urlopen(request, timeout=600) as response:
-                result_container['response'] = json.loads(response.read().decode('utf-8'))
-        except urllib.error.HTTPError as e:
-            # ← ключевая строка: сохраняем ТЕЛО ошибки
-            body = e.read().decode('utf-8', errors='replace')
-            error_container['error'] = f"HTTP {e.code}: {body}"
-        except Exception as e:
-            error_container['error'] = str(e)
-
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-
-    last_progress = -1
-    while thread.is_alive():
-        try:
-            progress_data = get_progress()
-            progress = progress_data.get('progress', 0)
-            eta = progress_data.get('eta_relative', 0)
-            if int(progress * 100) > last_progress:
-                last_progress = int(progress * 100)
-                if progress_callback:
-                    progress_callback(progress, eta)
-        except Exception:
-            pass
-        time.sleep(0.5)
-
-    thread.join()
-
-    if 'error' in error_container:
-        raise Exception(error_container['error'])
-    if 'response' not in result_container:
-        raise Exception("WebUI не вернул ответ")
-
-    return result_container['response']
+            while True:
+                done, _ = await asyncio.wait({request_task}, timeout=PROGRESS_POLL_INTERVAL)
+                if done:
+                    break
+                if progress_callback is None:
+                    continue
+                try:
+                    progress_data = await get_progress()
+                    progress = progress_data.get('progress', 0)
+                    eta = progress_data.get('eta_relative', 0)
+                    state = progress_data.get('state') or {}
+                    key = (int(progress * 100), state.get('sampling_step'))
+                    if key != last_key:
+                        last_key = key
+                        await progress_callback(progress, eta, state)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # прогресс — «косметика», он не должен ронять генерацию
+                    log.debug("Ошибка обновления прогресса: %s", e)
+            return request_task.result()  # SDError с телом ответа WebUI, если запрос не удался
+        except asyncio.CancelledError:
+            request_task.cancel()
+            try:
+                await request_task
+            except BaseException:
+                pass
+            raise
+        finally:
+            if not request_task.done():
+                request_task.cancel()
 
 
 # ===== ПРОВЕРКА ДОСТУПНОСТИ =====
-def check_api_available() -> bool:
+async def check_api_available() -> bool:
     """Проверяет доступность API сервера (лёгкий GET-запрос; раньше здесь запускалась пробная генерация)"""
     try:
-        _get_json("sdapi/v1/options", timeout=10)
+        await _get_json("sdapi/v1/options", timeout=10)
         return True
     except Exception:
         return False
@@ -278,7 +276,7 @@ def get_adetailer_status(api_response: dict) -> Dict[str, Any]:
 _adetailer_available_cache: Optional[bool] = None
 
 
-def check_adetailer_available(force_refresh: bool = False) -> bool:
+async def check_adetailer_available(force_refresh: bool = False) -> bool:
     """Проверяет, что расширение ADetailer установлено и доступно через API"""
     global _adetailer_available_cache
     if _adetailer_available_cache is not None and not force_refresh:
@@ -286,7 +284,7 @@ def check_adetailer_available(force_refresh: bool = False) -> bool:
 
     available = False
     try:
-        scripts = _get_json("sdapi/v1/scripts", timeout=10)
+        scripts = await _get_json("sdapi/v1/scripts", timeout=10)
         for tab in scripts.values():
             for script_name, _label in tab.get("txt2img", []) + tab.get("img2img", []):
                 if str(script_name).lower() == "adetailer":
@@ -297,7 +295,7 @@ def check_adetailer_available(force_refresh: bool = False) -> bool:
     if not available:
         # Запасная проверка: попытка прочитать список детекторов расширения
         try:
-            _get_json("adetailer/models", timeout=5)
+            await _get_json("adetailer/models", timeout=5)
             available = True
         except Exception:
             pass
@@ -306,7 +304,7 @@ def check_adetailer_available(force_refresh: bool = False) -> bool:
     return available
 
 
-def get_adetailer_models(force_refresh: bool = False) -> List[Dict[str, str]]:
+async def get_adetailer_models(force_refresh: bool = False) -> List[Dict[str, str]]:
     """
     Получает список моделей детекторов ADetailer с сервера.
 
@@ -329,7 +327,7 @@ def get_adetailer_models(force_refresh: bool = False) -> List[Dict[str, str]]:
 
     models: List[Dict[str, str]] = []
     try:
-        data = _get_json("adetailer/models", timeout=10)
+        data = await _get_json("adetailer/models", timeout=10)
         raw_list = data.get("models") if isinstance(data, dict) else data
         if isinstance(raw_list, list):
             for item in raw_list:
@@ -353,7 +351,7 @@ def get_adetailer_models(force_refresh: bool = False) -> List[Dict[str, str]]:
     return result
 
 
-def build_adetailer_script_args(user_id: str, overrides: Optional[dict] = None) -> Optional[dict]:
+async def build_adetailer_script_args(user_id: str, overrides: Optional[dict] = None) -> Optional[dict]:
     """
     Собирает блок alwayson_scripts['ADetailer'] из настроек пользователя.
 
@@ -363,9 +361,9 @@ def build_adetailer_script_args(user_id: str, overrides: Optional[dict] = None) 
     if build_adetailer_args is None or get_adetailer_enabled is None:
         return None
     try:
-        if not get_adetailer_enabled(user_id):
+        if not await get_adetailer_enabled(user_id):
             return None
-        args = build_adetailer_args(user_id, overrides)
+        args = await build_adetailer_args(user_id, overrides)
     except Exception as e:
         print(f"⚠️ Ошибка сборки настроек ADetailer: {e}")
         return None
@@ -375,54 +373,46 @@ def build_adetailer_script_args(user_id: str, overrides: Optional[dict] = None) 
 
 
 # ===== ОБРАБОТКА ПРОМПТА ЧЕРЕЗ НЕЙРОСЕТЬ =====
-def preprocess_prompt(user_id: str, raw_prompt: str, status_callback: Optional[Callable[[str], None]] = None) -> str:
+async def preprocess_prompt(user_id: str, raw_prompt: str, status_callback: Optional[Callable[[str], None]] = None) -> str:
     """
     Обрабатывает промпт через локальную нейросеть (если включено в настройках)
     """
     # Проверяем, включена ли обработка
-    if not get_prompt_processing_enabled(user_id):
+    if not await get_prompt_processing_enabled(user_id):
         if status_callback:
-            status_callback("⚡ Обработка промпта выключена, использую оригинал")
+            await status_callback("⚡ Обработка промпта выключена, использую оригинал")
         return raw_prompt
     
     if status_callback:
-        status_callback("🔄 Обработка промпта через нейросеть...")
+        await status_callback("🔄 Обработка промпта через нейросеть...")
     
     try:
-        processed = fast_process(raw_prompt)
+        processed = await fast_process(raw_prompt)
         if status_callback:
-            status_callback(f"✅ Промпт обработан")
+            await status_callback(f"✅ Промпт обработан")
         return processed
     except Exception as e:
         print(f"Ошибка обработки промпта: {e}")
         if status_callback:
-            status_callback("⚠️ Ошибка обработки, использую оригинальный промпт")
+            await status_callback("⚠️ Ошибка обработки, использую оригинальный промпт")
         return raw_prompt
 
 # ===== ПОЛУЧЕНИЕ СПИСКА СЭМПЛЕРОВ =====
-def get_samplers_list() -> List[str]:
+async def get_samplers_list() -> List[str]:
     """Получает список доступных сэмплеров из API Stable Diffusion"""
     try:
-        url = f"{SD_BASE_URL}/sdapi/v1/samplers"
-        request = urllib.request.Request(url, headers={'Content-Type': 'application/json'}, method='GET')
-        with urllib.request.urlopen(request, timeout=10) as response:
-            data = json.loads(response.read().decode('utf-8'))
-            if isinstance(data, list):
-                # Извлекаем имена сэмплеров
-                samplers = []
-                for item in data:
-                    if isinstance(item, dict) and 'name' in item:
-                        samplers.append(item['name'])
-                return samplers
-            return []
+        data = await sd_get_json("sdapi/v1/samplers", timeout=10)
+        if isinstance(data, list):
+            return [item['name'] for item in data if isinstance(item, dict) and 'name' in item]
+        return []
     except Exception as e:
         print(f"Ошибка получения списка сэмплеров: {e}")
         return []
     
 # ===== УЛУЧШЕНИЕ ПРОМПТА ДЛЯ РАЗНООБРАЗИЯ =====
-def enhance_prompt_for_diversity(prompt: str, user_id: str, user_settings: dict) -> str:
+async def enhance_prompt_for_diversity(prompt: str, user_id: str, user_settings: dict) -> str:
     """Улучшает промпт для получения разных лиц"""
-    diversity_mode = get_diversity_mode(user_id)
+    diversity_mode = await get_diversity_mode(user_id)
     
     if diversity_mode == "off":
         return prompt
@@ -456,14 +446,14 @@ def enhance_prompt_for_diversity(prompt: str, user_id: str, user_settings: dict)
     return enhanced
 
 
-def build_negative_prompt(user_id: str, custom_negative: str = None) -> str:
+async def build_negative_prompt(user_id: str, custom_negative: str = None) -> str:
     """Формирует финальный негативный промпт: базовый текст + анти-мутационные фразы + негативные эмбеддинги."""
-    use_advanced = get_use_advanced_negative(user_id)
+    use_advanced = await get_use_advanced_negative(user_id)
 
     if custom_negative:
         user_negative = custom_negative
     else:
-        user_negative = get_user_negative_prompt(user_id)
+        user_negative = await get_user_negative_prompt(user_id)
 
     # Универсальные фразы против мутаций и деформаций (если их ещё нет)
     extra_neg = "bad anatomy, extra limbs, deformed, mutated, disfigured, malformed, gross proportions, missing limbs, fused body, bad hands, bad fingers"
@@ -471,21 +461,23 @@ def build_negative_prompt(user_id: str, custom_negative: str = None) -> str:
         user_negative = f"{user_negative}, {extra_neg}"
 
     # Эмбеддинги: выбор пользователя (меню «Негативный промпт → Эмбеддинги») либо рекомендованные из WebUI
-    embedding_tags = effective_negative_embeddings(get_user_settings(user_id))
-    return get_negative_prompt_with_embeddings(user_negative, use_advanced, embedding_tags)
+    embedding_tags = await effective_negative_embeddings(await get_user_settings(user_id))
+    # чистая функция (при embedding_tags=None проверяет файлы на диске) — выполняем в потоке
+    return await asyncio.to_thread(get_negative_prompt_with_embeddings, user_negative, use_advanced, embedding_tags)
 
 
 # Отчёт ADetailer последней генерации в ТЕКУЩЕМ потоке (раньше это был общий атрибут функции,
 # который параллельные генерации перезаписывали друг у друга).
-_tls = threading.local()
+# ContextVar вместо threading.local: в asyncio все задачи живут в одном потоке, а у каждой задачи свой контекст.
+_last_adetailer_status: contextvars.ContextVar = contextvars.ContextVar("last_adetailer_status", default=None)
 MAX_SEED = 2**32 - 1  # WebUI принимает seed только до 2^32-1
 
 
 def get_last_adetailer_status() -> Dict[str, Any]:
-    return getattr(_tls, "last_adetailer_status", {"detected": 0, "detections": [], "models": []})
+    return _last_adetailer_status.get() or {"detected": 0, "detections": [], "models": []}
 
 
-def generate_txt2img(
+async def generate_txt2img(
     prompt: str, 
     user_id: str, 
     user_settings: dict,
@@ -516,18 +508,18 @@ def generate_txt2img(
         processed_prompt = exact_prompt
         enhanced_prompt = exact_prompt
         if status_callback:
-            status_callback("🎨 Генерация изображения...")
+            await status_callback("🎨 Генерация изображения...")
     else:
         # Обрабатываем промпт через нейросеть (если включено)
-        processed_prompt = preprocess_prompt(user_id, prompt, status_callback)
+        processed_prompt = await preprocess_prompt(user_id, prompt, status_callback)
         # Добавляем активные LoRA в промпт
-        lora_tags = get_active_lora_tags(user_id)
+        lora_tags = await get_active_lora_tags(user_id)
         if lora_tags:
             processed_prompt = f"{processed_prompt}, {lora_tags}"
         if status_callback:
-            status_callback("🎨 Генерация изображения...")
+            await status_callback("🎨 Генерация изображения...")
         # Используем обработанный промпт для дальнейшей обработки
-        enhanced_prompt = enhance_prompt_for_diversity(processed_prompt, user_id, user_settings)
+        enhanced_prompt = await enhance_prompt_for_diversity(processed_prompt, user_id, user_settings)
 
     # Используем фиксированный seed если передан, иначе случайный
     if fixed_seed is not None:
@@ -535,7 +527,7 @@ def generate_txt2img(
     else:
         seed = random.randint(1, MAX_SEED)
 
-    negative_prompt = exact_negative if exact_negative is not None else build_negative_prompt(user_id)
+    negative_prompt = exact_negative if exact_negative is not None else await build_negative_prompt(user_id)
     
     # Получаем сэмплер из настроек, если он там есть
     sampler = user_settings.get("sampler_name", "Euler a")
@@ -554,24 +546,25 @@ def generate_txt2img(
     }
 
     # ===== ADETAILER: автодетекция и перерисовка лиц/рук =====
-    ad_block = build_adetailer_script_args(user_id, adetailer_overrides)
+    ad_block = await build_adetailer_script_args(user_id, adetailer_overrides)
     if ad_block:
         payload["alwayson_scripts"] = dict(payload.get("alwayson_scripts") or {})
         payload["alwayson_scripts"]["ADetailer"] = ad_block
         model_name = ad_block["args"][0].get("ad_model", "?")
         if status_callback:
-            status_callback(f"🕵️ ADetailer: модель `{model_name}`")
+            await status_callback(f"🕵️ ADetailer: модель `{model_name}`")
         print(f"🕵️ ADetailer txt2img: model={model_name}")
 
-    apply_model_override(payload, user_settings)
-    response = generate_with_progress(payload, progress_callback)
+    apply_hires(payload, user_settings)
+    await apply_model_override(payload, user_settings)
+    response = await generate_with_progress(payload, progress_callback)
 
     # Сохраняем отчёт ADetailer, чтобы бот мог показать его в капшне
     try:
-        _tls.last_adetailer_status = get_adetailer_status(response)
+        _last_adetailer_status.set(get_adetailer_status(response))
     except Exception as e:  # pragma: no cover - диагностика не должна ломать генерацию
         print(f"⚠️ Не удалось разобрать отчёт ADetailer: {e}")
-        _tls.last_adetailer_status = {"detected": 0, "detections": [], "models": []}
+        _last_adetailer_status.set({"detected": 0, "detections": [], "models": []})
 
     images = []
     for index, img_base64 in enumerate(response.get('images', [])):
@@ -586,7 +579,7 @@ def generate_txt2img(
 
 
 # ===== ГЕНЕРАЦИЯ С КАСТОМНЫМ НЕГАТИВОМ =====
-def generate_txt2img_advanced(
+async def generate_txt2img_advanced(
     prompt: str,
     negative_prompt: str,
     user_settings: dict,
@@ -599,7 +592,7 @@ def generate_txt2img_advanced(
     seed = random.randint(1, MAX_SEED)
 
     # Негативные эмбеддинги пользователя добавляются и к «ручному» негативу (без дублей)
-    embedding_tags = effective_negative_embeddings(user_settings)
+    embedding_tags = await effective_negative_embeddings(user_settings)
     if embedding_tags:
         negative_prompt = _merge_unique_tags(negative_prompt, ", ".join(embedding_tags))
 
@@ -617,14 +610,15 @@ def generate_txt2img_advanced(
     }
 
     # ===== ADETAILER: автодетекция и перерисовка лиц/рук =====
-    ad_block = build_adetailer_script_args(user_id, adetailer_overrides)
+    ad_block = await build_adetailer_script_args(user_id, adetailer_overrides)
     if ad_block:
         payload["alwayson_scripts"] = dict(payload.get("alwayson_scripts") or {})
         payload["alwayson_scripts"]["ADetailer"] = ad_block
         print(f"🕵️ ADetailer txt2img (advanced): model={ad_block['args'][0].get('ad_model', '?')}")
 
-    apply_model_override(payload, user_settings)
-    response = generate_with_progress(payload, progress_callback)
+    apply_hires(payload, user_settings)
+    await apply_model_override(payload, user_settings)
+    response = await generate_with_progress(payload, progress_callback)
 
     images = []
     for index, img_base64 in enumerate(response.get('images', [])):
@@ -640,7 +634,7 @@ def generate_txt2img_advanced(
 
 # ===== REACTOR ФУНКЦИИ ДЛЯ РАБОТЫ С ЛИЦАМИ =====
 
-def swap_face_with_reactor(
+async def swap_face_with_reactor(
     source_image: Optional[io.BytesIO],
     target_image: io.BytesIO,
     face_model: str = "None",
@@ -659,7 +653,7 @@ def swap_face_with_reactor(
     face_index = [0] if face_index is None else face_index
 
     target_image.seek(0)
-    target_base64 = base64.b64encode(target_image.read()).decode('utf-8')
+    target_base64 = await _b64encode(target_image.read())
     
     payload = {
         "target_image": target_base64,
@@ -677,139 +671,99 @@ def swap_face_with_reactor(
     
     if source_image is not None:
         source_image.seek(0)
-        source_base64 = base64.b64encode(source_image.read()).decode('utf-8')
+        source_base64 = await _b64encode(source_image.read())
         payload["source_image"] = source_base64
     
     # Пробуем разные возможные эндпоинты
-    endpoints = [
-        f'{SD_BASE_URL}/reactor/image',
-        f'{SD_BASE_URL}/reactor/swap-face',
-        f'{SD_BASE_URL}/sdapi/v1/reactor/image'
-    ]
-    
+    paths = ['reactor/image', 'reactor/swap-face', 'sdapi/v1/reactor/image']
+
     last_error = None
-    for endpoint in endpoints:
-        try:
-            request = urllib.request.Request(
-                endpoint,
-                headers={'Content-Type': 'application/json'},
-                data=json.dumps(payload).encode('utf-8'),
-                method='POST'
-            )
-            
-            with urllib.request.urlopen(request, timeout=60) as response:
-                result = json.loads(response.read().decode('utf-8'))
-            
-            # Проверяем формат ответа
-            if 'image' in result:
-                image_bytes = base64.b64decode(result['image'])
-            elif 'images' in result and result['images']:
-                image_bytes = base64.b64decode(result['images'][0])
-            else:
-                raise Exception("Неизвестный формат ответа от Reactor")
-            
-            swapped_image = io.BytesIO(image_bytes)
-            swapped_image.name = "swapped_face.png"
-            return swapped_image
-            
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode('utf-8', errors='replace')
-            if e.code != 404:  # 404 — это просто «такого эндпоинта нет», настоящую причину не затираем
-                last_error = f"HTTP {e.code}: {error_body}"
-            elif last_error is None:
-                last_error = f"HTTP 404: эндпоинт {endpoint} не найден (установлен ли ReActor?)"
-            continue
-        except Exception as e:
-            last_error = str(e)
-            continue
+    session = await get_session()
+    async with sd_gate.slot():  # ReActor работает на том же GPU, что и генерация
+        for path in paths:
+            url = f'{SD_BASE_URL}/{path}'
+            try:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                    if resp.status >= 400:
+                        error_body = (await resp.text(errors='replace'))[:2000]
+                        if resp.status != 404:  # 404 — это просто «такого эндпоинта нет», настоящую причину не затираем
+                            last_error = f"HTTP {resp.status}: {error_body}"
+                        elif last_error is None:
+                            last_error = f"HTTP 404: эндпоинт {path} не найден (установлен ли ReActor?)"
+                        continue
+                    result = await resp.json(content_type=None)
+
+                # Проверяем формат ответа
+                if 'image' in result:
+                    encoded = result['image']
+                elif 'images' in result and result['images']:
+                    encoded = result['images'][0]
+                else:
+                    raise Exception("Неизвестный формат ответа от Reactor")
+
+                image_bytes = await asyncio.to_thread(decode_base64_to_bytes, encoded)
+                swapped_image = io.BytesIO(image_bytes)
+                swapped_image.name = "swapped_face.png"
+                return swapped_image
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                last_error = str(e)
+                continue
 
     raise Exception(f"Не удалось заменить лицо. Последняя ошибка: {last_error}")
 
 
-def get_reactor_models() -> Dict[str, List[str]]:
+async def get_reactor_models() -> Dict[str, List[str]]:
     """Получает список доступных моделей из Reactor"""
     models_info = {
         "facemodels": [],
         "upscalers": []
     }
-    
+
     # Получаем модели лиц
-    endpoints_face = [
-        f'{SD_BASE_URL}/reactor/facemodels',
-        f'{SD_BASE_URL}/reactor/models',
-        f'{SD_BASE_URL}/sdapi/v1/reactor/facemodels'
-    ]
-    
-    for endpoint in endpoints_face:
+    for path in ('reactor/facemodels', 'reactor/models', 'sdapi/v1/reactor/facemodels'):
         try:
-            request = urllib.request.Request(
-                endpoint,
-                headers={'Content-Type': 'application/json'},
-                method='GET'
-            )
-            with urllib.request.urlopen(request, timeout=10) as response:
-                data = json.loads(response.read().decode('utf-8'))
-                if isinstance(data, list):
-                    models_info["facemodels"] = data
-                elif isinstance(data, dict) and 'models' in data:
-                    models_info["facemodels"] = data['models']
-                elif isinstance(data, dict) and 'facemodels' in data:
-                    models_info["facemodels"] = data['facemodels']
-                break
+            data = await sd_get_json(path, timeout=10)
+            if isinstance(data, list):
+                models_info["facemodels"] = data
+            elif isinstance(data, dict) and 'models' in data:
+                models_info["facemodels"] = data['models']
+            elif isinstance(data, dict) and 'facemodels' in data:
+                models_info["facemodels"] = data['facemodels']
+            break
         except Exception:
             continue
-    
+
     # Получаем апскейлеры
-    endpoints_upscalers = [
-        f'{SD_BASE_URL}/reactor/upscalers',
-        f'{SD_BASE_URL}/sdapi/v1/reactor/upscalers'
-    ]
-    
-    for endpoint in endpoints_upscalers:
+    for path in ('reactor/upscalers', 'sdapi/v1/reactor/upscalers'):
         try:
-            request = urllib.request.Request(
-                endpoint,
-                headers={'Content-Type': 'application/json'},
-                method='GET'
-            )
-            with urllib.request.urlopen(request, timeout=10) as response:
-                data = json.loads(response.read().decode('utf-8'))
-                if isinstance(data, list):
-                    models_info["upscalers"] = data
-                elif isinstance(data, dict) and 'upscalers' in data:
-                    models_info["upscalers"] = data['upscalers']
-                break
+            data = await sd_get_json(path, timeout=10)
+            if isinstance(data, list):
+                models_info["upscalers"] = data
+            elif isinstance(data, dict) and 'upscalers' in data:
+                models_info["upscalers"] = data['upscalers']
+            break
         except Exception:
             continue
-    
+
     return models_info
 
 
-def check_reactor_available() -> bool:
+async def check_reactor_available() -> bool:
     """Проверяет доступность Reactor API"""
-    endpoints = [
-        f'{SD_BASE_URL}/reactor/models',
-        f'{SD_BASE_URL}/reactor/facemodels',
-        f'{SD_BASE_URL}/reactor/image'
-    ]
-    
-    for endpoint in endpoints:
+    for path in ('reactor/models', 'reactor/facemodels', 'reactor/image'):
         try:
-            request = urllib.request.Request(
-                endpoint,
-                headers={'Content-Type': 'application/json'},
-                method='GET'
-            )
-            urllib.request.urlopen(request, timeout=5)
+            await sd_get_json(path, timeout=5)
             return True
         except Exception:
             continue
-    
     return False
 
 
 # ===== IMG2IMG =====
-def generate_img2img(
+async def generate_img2img(
     prompt: str,
     init_image: io.BytesIO,
     user_settings: dict,
@@ -826,7 +780,7 @@ def generate_img2img(
     payload = {
         "init_images": [init_base64],
         "prompt": prompt,
-        "negative_prompt": build_negative_prompt(user_id),
+        "negative_prompt": await build_negative_prompt(user_id),
         "denoising_strength": user_settings.get("denoising_strength", 0.75),
         "steps": user_settings.get("steps", 20),
         "width": width,
@@ -838,14 +792,14 @@ def generate_img2img(
     }
 
     # ===== ADETAILER: перерисовка лиц/рук поверх img2img =====
-    ad_block = build_adetailer_script_args(user_id, adetailer_overrides)
+    ad_block = await build_adetailer_script_args(user_id, adetailer_overrides)
     if ad_block:
         payload["alwayson_scripts"] = dict(payload.get("alwayson_scripts") or {})
         payload["alwayson_scripts"]["ADetailer"] = ad_block
         print(f"🕵️ ADetailer img2img: model={ad_block['args'][0].get('ad_model', '?')}")
 
-    apply_model_override(payload, user_settings)
-    response = generate_with_progress(payload, progress_callback, endpoint="sdapi/v1/img2img")
+    await apply_model_override(payload, user_settings)
+    response = await generate_with_progress(payload, progress_callback, endpoint="sdapi/v1/img2img")
 
     images = []
     for index, img_base64 in enumerate(response.get('images', [])):
@@ -858,16 +812,16 @@ def generate_img2img(
 
 
 # ===== АПСКЕЙЛ =====
-def upscale_image(
+async def upscale_image(
     image: io.BytesIO,
     upscale_factor: float = 2,
     upscaler_name: str = "ESRGAN_4x",
     face_restoration: float = 0.5
 ) -> io.BytesIO:
-    """Увеличивает разрешение изображения"""
+    """Увеличивает разрешение изображения (base64 больших картинок кодируется/декодируется в потоке)"""
     image.seek(0)
-    image_base64 = base64.b64encode(image.read()).decode('utf-8')
-    
+    image_base64 = await _b64encode(image.read())
+
     payload = {
         "image": image_base64,
         "upscaling_resize": upscale_factor,
@@ -876,17 +830,18 @@ def upscale_image(
         "codeformer_visibility": face_restoration,
     }
 
-    response = call_api("sdapi/v1/extra-single-image", **payload)
-    
-    image_bytes = base64.b64decode(response.get('image', ''))
+    async with sd_gate.slot():
+        response = await call_api("sdapi/v1/extra-single-image", **payload)
+
+    image_bytes = await asyncio.to_thread(decode_base64_to_bytes, response.get('image', ''))
     image_file = io.BytesIO(image_bytes)
     image_file.name = "upscaled.png"
-    
+
     return image_file
 
 
 # ===== INPAINT =====
-def generate_inpaint(
+async def generate_inpaint(
     prompt: str,
     init_image: io.BytesIO,
     mask: io.BytesIO,
@@ -911,7 +866,7 @@ def generate_inpaint(
         "init_images": [init_base64],
         "mask": mask_base64,
         "prompt": prompt,
-        "negative_prompt": build_negative_prompt(user_id),
+        "negative_prompt": await build_negative_prompt(user_id),
         "denoising_strength": settings.get("denoising_strength", 0.75),
         "steps": settings.get("steps", 20),
         "width": width,
@@ -924,8 +879,8 @@ def generate_inpaint(
         "mask_blur": 4,
     }
 
-    apply_model_override(payload, settings)
-    response = generate_with_progress(payload, progress_callback, endpoint="sdapi/v1/img2img")
+    await apply_model_override(payload, settings)
+    response = await generate_with_progress(payload, progress_callback, endpoint="sdapi/v1/img2img")
     images = response.get('images', [])
     if not images:
         raise Exception("API не вернул изображений")
@@ -936,40 +891,31 @@ def generate_inpaint(
     return image_file
 
 
-def get_loras_list() -> List[Dict[str, str]]:
+async def get_loras_list() -> List[Dict[str, str]]:
     """Получает список доступных LoRA из API Stable Diffusion"""
     try:
-        url = f"{SD_BASE_URL}/sdapi/v1/loras"
-        request = urllib.request.Request(url, headers={'Content-Type': 'application/json'}, method='GET')
-        with urllib.request.urlopen(request, timeout=10) as response:
-            data = json.loads(response.read().decode('utf-8'))
-            # Ожидаем список объектов с полями name, filename и т.д.
-            if isinstance(data, list):
-                result = []
-                for item in data:
-                    # Попробуем извлечь имя
-                    if isinstance(item, dict):
-                        name = item.get('name') or item.get('filename') or item.get('alias')
-                        if name:
-                            # Создаём понятный тег
-                            # Имя обычно заканчивается на .safetensors или .pt, убираем
-                            clean_name = name.replace('.safetensors', '').replace('.pt', '').replace('.bin', '')
-                            tag = f"<lora:{clean_name}:1>"
-                            result.append({
-                                "id": clean_name,
-                                "name": clean_name.replace('_', ' ').title(),  # человеческий вид
-                                "tag": tag,
-                                "filename": name
-                            })
-                return result
-            else:
-                return []
+        data = await sd_get_json("sdapi/v1/loras", timeout=10)
+        result = []
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    name = item.get('name') or item.get('filename') or item.get('alias')
+                    if name:
+                        # Имя обычно заканчивается на .safetensors или .pt, убираем
+                        clean_name = name.replace('.safetensors', '').replace('.pt', '').replace('.bin', '')
+                        result.append({
+                            "id": clean_name,
+                            "name": clean_name.replace('_', ' ').title(),  # человеческий вид
+                            "tag": f"<lora:{clean_name}:1>",
+                            "filename": name
+                        })
+        return result
     except Exception as e:
         print(f"Ошибка получения списка LoRA: {e}")
         return []
 
 # ===== СОВМЕСТИМОСТЬ СО СТАРЫМ КОДОМ =====
-def generate_image(
+async def generate_image(
     prompt: str, 
     user_settings: dict, 
     user_id: str = None,
@@ -983,7 +929,7 @@ def generate_image(
     if user_id is None:
         user_id = "default"
 
-    images, seed, original_prompt, processed_prompt = generate_txt2img(
+    images, seed, original_prompt, processed_prompt = await generate_txt2img(
         prompt, user_id, user_settings, progress_callback, status_callback, fixed_seed,
         exact_prompt=exact_prompt, exact_negative=exact_negative
     )

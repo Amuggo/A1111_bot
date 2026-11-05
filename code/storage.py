@@ -15,6 +15,7 @@
     после чего хранилище начинает с пустых данных.
 """
 
+import asyncio
 import copy
 import json
 import os
@@ -101,3 +102,14 @@ class JsonStore:
             if before != after or not os.path.exists(self.path):
                 self._write_unlocked(data)
             return result
+
+    # ---- асинхронные обёртки: блокирующий ввод-вывод уходит в поток, цикл событий не блокируется ----
+    async def aread(self) -> Any:
+        return await asyncio.to_thread(self.read)
+
+    async def awrite(self, data: Any) -> None:
+        await asyncio.to_thread(self.write, data)
+
+    async def aupdate(self, mutator: Callable[[Any], Any]) -> Any:
+        """Атомарное «прочитать → изменить → записать» в потоке (mutator должен быть быстрым и без await)."""
+        return await asyncio.to_thread(self.update, mutator)

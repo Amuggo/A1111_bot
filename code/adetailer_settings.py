@@ -88,9 +88,9 @@ MERGE_INVERT_VALUES = ["None", "Merge", "Merge and Invert"]
 _STORE = JsonStore(ADETAILER_SETTINGS_FILE)
 
 
-def _load_all_settings() -> dict:
+async def _load_all_settings() -> dict:
     """Загружает настройки ADetailer всех пользователей"""
-    return _STORE.read()
+    return await _STORE.aread()
 
 
 def _fill_defaults(user_settings: dict) -> dict:
@@ -100,7 +100,7 @@ def _fill_defaults(user_settings: dict) -> dict:
     return user_settings
 
 
-def get_adetailer_settings(user_id: str) -> Dict[str, Any]:
+async def get_adetailer_settings(user_id: str) -> Dict[str, Any]:
     """Возвращает настройки ADetailer пользователя (с дефолтами); файл пишется только при изменении"""
     user_id = str(user_id)
 
@@ -109,15 +109,15 @@ def get_adetailer_settings(user_id: str) -> Dict[str, Any]:
         all_settings[user_id] = user_settings
         return copy.deepcopy(user_settings)
 
-    return _STORE.update(mutator)
+    return await _STORE.aupdate(mutator)
 
 
-def save_adetailer_settings(user_id: str, settings: Dict[str, Any]):
+async def save_adetailer_settings(user_id: str, settings: Dict[str, Any]):
     """Сохраняет настройки ADetailer пользователя (замена целиком)"""
-    _STORE.update(lambda all_settings: all_settings.__setitem__(str(user_id), copy.deepcopy(settings)))
+    await _STORE.aupdate(lambda all_settings: all_settings.__setitem__(str(user_id), copy.deepcopy(settings)))
 
 
-def set_adetailer_setting(user_id: str, key: str, value: Any):
+async def set_adetailer_setting(user_id: str, key: str, value: Any):
     """Устанавливает отдельную настройку (атомарно)"""
     user_id = str(user_id)
 
@@ -126,23 +126,23 @@ def set_adetailer_setting(user_id: str, key: str, value: Any):
         user_settings[key] = value
         all_settings[user_id] = user_settings
 
-    _STORE.update(mutator)
+    await _STORE.aupdate(mutator)
 
 
-def get_adetailer_enabled(user_id: str) -> bool:
-    return bool(get_adetailer_settings(user_id).get("ad_enabled", False))
+async def get_adetailer_enabled(user_id: str) -> bool:
+    return bool((await get_adetailer_settings(user_id)).get("ad_enabled", False))
 
 
-def set_adetailer_enabled(user_id: str, enabled: bool):
-    set_adetailer_setting(user_id, "ad_enabled", bool(enabled))
+async def set_adetailer_enabled(user_id: str, enabled: bool):
+    await set_adetailer_setting(user_id, "ad_enabled", bool(enabled))
 
 
-def get_adetailer_model(user_id: str) -> str:
-    return get_adetailer_settings(user_id).get("ad_model", "None")
+async def get_adetailer_model(user_id: str) -> str:
+    return (await get_adetailer_settings(user_id)).get("ad_model", "None")
 
 
-def set_adetailer_model(user_id: str, model: str):
-    set_adetailer_setting(user_id, "ad_model", model)
+async def set_adetailer_model(user_id: str, model: str):
+    await set_adetailer_setting(user_id, "ad_model", model)
 
 
 def get_ad_model_display_name(model: str) -> str:
@@ -152,14 +152,14 @@ def get_ad_model_display_name(model: str) -> str:
     return MODEL_DISPLAY_NAMES.get(model, model)
 
 
-def build_adetailer_args(user_id: str, overrides: Dict[str, Any] = None) -> Dict[str, Any]:
+async def build_adetailer_args(user_id: str, overrides: Dict[str, Any] = None) -> Dict[str, Any]:
     """
     Собирает словарь аргументов ADetailer для передачи в API.
 
     Возвращает только те ключи, которые реально понимает расширение
     (is_api=True обязателен — иначе WebUI падает при валидации pydantic).
     """
-    settings = get_adetailer_settings(user_id)
+    settings = await get_adetailer_settings(user_id)
     if overrides:
         settings = {**settings, **overrides}
 
@@ -178,9 +178,9 @@ def build_adetailer_args(user_id: str, overrides: Dict[str, Any] = None) -> Dict
     return args
 
 
-def summarize_adetailer_settings(user_id: str) -> str:
+async def summarize_adetailer_settings(user_id: str) -> str:
     """Короткое текстовое описание текущих настроек (для капшнов и меню)"""
-    s = get_adetailer_settings(user_id)
+    s = await get_adetailer_settings(user_id)
     if not s.get("ad_enabled"):
         return "🕵️ ADetailer: ❌ выключен"
     lines = [
