@@ -14,7 +14,7 @@ from settings import get_active_lora_tags
 import pandas as pd
 
 # Импортируем общие утилиты из Aapi (прогресс, негативный промпт)
-from Aapi import generate_with_progress, build_negative_prompt, apply_model_override, fit_dims_to_image, MAX_SEED, _b64encode, decode_base64_to_bytes
+from Aapi import generate_with_progress, build_negative_prompt, apply_model_override, fit_dims_to_image, MAX_SEED, _b64encode, decode_base64_to_bytes, apply_faceid_to_payload
 
 # ===== КОНФИГУРАЦИЯ =====
 CONTROLNET_IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "controlnet_images")
@@ -85,14 +85,14 @@ def _load_parquet_item(filename: str, index: int, col: str) -> Optional[io.Bytes
                 if isinstance(data, str):
                     try:
                         return io.BytesIO(base64.b64decode(data))
-                    except:
+                    except Exception:
                         pass
     elif isinstance(raw, bytes):
         return io.BytesIO(raw)
     elif isinstance(raw, str):
         try:
             return io.BytesIO(base64.b64decode(raw))
-        except:
+        except Exception:
             pass
     return None
 
@@ -203,7 +203,7 @@ def _get_controlnet_sources_sync() -> List[Dict[str, Any]]:
         num = s.get('number', 0)
         try:
             num = int(num)
-        except:
+        except Exception:
             num = 0
         return (cat, num)
 
@@ -341,7 +341,7 @@ async def generate_controlnet(
         f"control_img={len(control_bytes)}B"
     )
 
-    apply_model_override(payload, settings)
+    await apply_model_override(payload, settings)
     # img2img-запрос должен идти на img2img (раньше по ошибке — на txt2img, и init_images игнорировались)
     response = await generate_with_progress(payload, progress_callback, endpoint="sdapi/v1/img2img")
     images = response.get('images', [])
@@ -362,10 +362,13 @@ async def generate_txt2img_controlnet(
     settings: dict,
     progress_callback: Optional[Callable[[float, float], None]] = None,
     status_callback: Optional[Callable[[str], None]] = None,
-    user_id: str = "default"
+    user_id: str = "default",
+    face_image: Optional[io.BytesIO] = None,
+    face_weights: Optional[tuple] = None
 ) -> io.BytesIO:
     """
     Генерация txt2img с ControlNet (без исходного изображения).
+    face_image — эталонное лицо: добавляется вторым ControlNet-юнитом (IP-Adapter FaceID), нужен ≥2 юнитов в настройках ControlNet.
     """
     lora_tags = await get_active_lora_tags(user_id)
     if lora_tags:
@@ -430,7 +433,12 @@ async def generate_txt2img_controlnet(
         f"control_img={len(control_bytes)}B"
     )
 
-    apply_model_override(payload, settings)
+    faceid_applied = False
+    if face_image is not None:
+        fw, lw = face_weights if face_weights else (None, None)
+        faceid_applied = await apply_faceid_to_payload(payload, face_image, status_callback, fw, lw)
+
+    await apply_model_override(payload, settings)
     response = await generate_with_progress(payload, progress_callback)
     images = response.get('images', [])
     if not images:
@@ -440,4 +448,5 @@ async def generate_txt2img_controlnet(
     image_file = io.BytesIO(image_bytes)
     image_file.name = "controlnet_txt2img.png"
     image_file.seed = seed  # main.py показывает seed в подписи
+    image_file.faceid_used = faceid_applied
     return image_file
