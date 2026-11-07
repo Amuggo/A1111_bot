@@ -1,4 +1,5 @@
 import copy
+import re
 import os
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -30,6 +31,7 @@ DEFAULT_SETTINGS = {
     "diversity_mode": "auto",
     "prompt_processing": False,
     "lora_enabled": {},  # заполняется динамически
+    "lora_weights": {},  # вес каждой LoRA в промпте (по умолчанию 1.0)
     "sd_model": None,  # выбранная модель (None = модель по умолчанию)
     # Негативные эмбеддинги: None = не настраивались (используются рекомендованные, если они есть в WebUI),
     # список = явный выбор пользователя (пустой список = не использовать эмбеддинги).
@@ -64,15 +66,10 @@ async def fetch_loras_from_api() -> Dict[str, Dict[str, str]]:
             name = lora.get("name", "")
             base_name = name.rsplit('.', 1)[0] if '.' in name else name
             display_name = lora.get("alias") or base_name
-
-            # Исключение для armpit_hair: ставим безопасный вес 0.5 вместо 1
-            if "armpit_hair" in base_name.lower():
-                tag = f"<lora:{base_name}:0.5>"
-            else:
-                tag = f"<lora:{base_name}:1>"
+            tag = f"<lora:{base_name}:1>"
 
             result[base_name] = {"name": display_name, "tag": tag}
-        print(f"✅ Загружено {len(result)} LoRA из API (обработано исключение для armpit_hair)")
+        print(f"✅ Загружено {len(result)} LoRA из API")
         return result
     except Exception as e:
         print(f"⚠️ Ошибка при запросе LoRA: {e}")
@@ -116,6 +113,11 @@ def _fill_defaults(user_settings: dict, available_loras: Dict[str, Any]) -> dict
         if key not in user_settings:
             user_settings[key] = copy.deepcopy(value)
     return user_settings
+
+
+async def user_exists(user_id: str) -> bool:
+    """Есть ли уже настройки пользователя (то есть он пользовался ботом раньше)."""
+    return str(user_id) in await _SETTINGS_STORE.aread()
 
 
 async def get_user_settings(user_id: str) -> dict:
@@ -219,14 +221,53 @@ async def set_user_lora_enabled(user_id: str, lora_name: str, enabled: bool):
     await update_user_settings(user_id, mutator=mutator)
 
 
+LORA_WEIGHT_STEPS = (0.4, 0.6, 0.8, 1.0, 1.2)
+
+
+async def get_user_lora_weights(user_id: str) -> Dict[str, float]:
+    """Вес каждой доступной LoRA у пользователя (по умолчанию 1.0)."""
+    raw = (await get_user_settings(user_id)).get("lora_weights") or {}
+    available = await get_available_loras()
+    weights = {}
+    for lora in available:
+        try:
+            weights[lora] = float(raw.get(lora, 1.0))
+        except (TypeError, ValueError):
+            weights[lora] = 1.0
+    return weights
+
+
+async def cycle_user_lora_weight(user_id: str, lora_name: str) -> float:
+    """Переключает вес LoRA на следующее значение из LORA_WEIGHT_STEPS и возвращает его."""
+    result = {}
+
+    def mutator(settings: dict):
+        weights = settings.get("lora_weights")
+        if not isinstance(weights, dict):
+            weights = settings["lora_weights"] = {}
+        try:
+            current = float(weights.get(lora_name, 1.0))
+        except (TypeError, ValueError):
+            current = 1.0
+        nearest = min(range(len(LORA_WEIGHT_STEPS)), key=lambda i: abs(LORA_WEIGHT_STEPS[i] - current))
+        result["w"] = LORA_WEIGHT_STEPS[(nearest + 1) % len(LORA_WEIGHT_STEPS)]
+        weights[lora_name] = result["w"]
+
+    await update_user_settings(user_id, mutator=mutator)
+    return result["w"]
+
+
 async def get_active_lora_tags(user_id: str) -> str:
-    """Возвращает строку с тегами LoRA для вставки в промпт (включённые)"""
+    """Возвращает строку с тегами LoRA для вставки в промпт (включённые, с весом пользователя)"""
     lora_enabled = await get_user_lora_enabled(user_id)
+    weights = await get_user_lora_weights(user_id)
     available = await get_available_loras()
     tags = []
     for lora_name, enabled in lora_enabled.items():
         if enabled and lora_name in available:
-            tags.append(available[lora_name]["tag"])
+            tag = available[lora_name]["tag"]
+            # <lora:имя:1> -> <lora:имя:вес>
+            tags.append(re.sub(r":[^:>]*>$", f":{weights.get(lora_name, 1.0):g}>", tag))
     return " ".join(tags)
 
 
@@ -552,7 +593,7 @@ def hires_plan(settings: dict) -> Optional[dict]:
 
 # ===== ПРЕСЕТЫ =====
 # Пресет — снимок настроек пользователя под именем. Хранится в его же записи (ключ "presets"), формат файла не менялся.
-PRESET_KEYS = ("sd_model", "lora_enabled", "negative_prompt", "negative_embeddings", "width", "height", "steps",
+PRESET_KEYS = ("sd_model", "lora_enabled", "lora_weights", "negative_prompt", "negative_embeddings", "width", "height", "steps",
                "cfg_scale", "sampler_name", "diversity_mode", "hires_enabled", "hires_scale", "hires_upscaler",
                "hires_denoise")
 MAX_PRESETS = 10

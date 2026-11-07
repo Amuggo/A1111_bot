@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Any, Iterable, List, Optional, Union
 
 from aiogram import Bot
+from aiogram.types import LabeledPrice
 from aiogram.types import (
     BotCommand as _BotCommand,
     BufferedInputFile,
@@ -188,6 +189,20 @@ class BotAPI:
 
     async def send_chat_action(self, chat_id: int, action: str = "typing") -> bool:
         return await self.bot.send_chat_action(chat_id=chat_id, action=action)
+
+    async def get_me(self) -> Any:
+        return await self.bot.get_me()
+
+    async def send_invoice(self, chat_id: int, title: str, description: str, payload: str, stars: int,
+                           label: str) -> Message:
+        """Счёт в Telegram Stars (валюта XTR; платёжный провайдер не нужен)."""
+        return await self.bot.send_invoice(
+            chat_id=chat_id, title=title, description=description, payload=payload, currency="XTR",
+            prices=[LabeledPrice(label=label, amount=int(stars))],
+        )
+
+    async def refund_star_payment(self, user_id: int, charge_id: str) -> Any:
+        return await self.bot.refund_star_payment(user_id=user_id, telegram_payment_charge_id=charge_id)
 
     async def set_my_commands(self, commands: Iterable[_BotCommand]) -> bool:
         return await self.bot.set_my_commands(list(commands))

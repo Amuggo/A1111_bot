@@ -110,6 +110,12 @@ class TaskQueue:
         markup.add(InlineKeyboardButton("❌ Отменить", callback_data=f"task_cancel_{task_id}"))
         return markup
 
+    def snapshot(self) -> List[dict]:
+        """Снимок незавершённых задач (для админ-консоли): id, чат, тип, состояние, возраст в секундах."""
+        now = time.monotonic()
+        return [{"id": t.id, "chat_id": t.chat_id, "kind": t.kind, "state": t.state, "age": now - t.created}
+                for t in sorted(self._tasks.values(), key=lambda t: t.id)]
+
     def user_tasks(self, chat_id: int) -> List[Task]:
         return [t for t in self._tasks.values() if t.chat_id == chat_id]
 

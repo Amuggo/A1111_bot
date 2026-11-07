@@ -113,6 +113,7 @@ SETTINGS_FILE = os.path.join(DATA_DIR, get_env("SETTINGS_FILE_NAME", "user_setti
 FACE_SETTINGS_FILE = os.path.join(DATA_DIR, get_env("FACE_SETTINGS_FILE_NAME", "face_settings.json"))
 CONTROLNET_SETTINGS_FILE = os.path.join(DATA_DIR, get_env("CONTROLNET_SETTINGS_FILE_NAME", "controlnet_user_settings.json"))
 ADETAILER_SETTINGS_FILE = os.path.join(DATA_DIR, get_env("ADETAILER_SETTINGS_FILE_NAME", "adetailer_user_settings.json"))
+SUBSCRIPTIONS_FILE = os.path.join(DATA_DIR, get_env("SUBSCRIPTIONS_FILE_NAME", "subscriptions.json"))
 PROMPT_LOG_FILE = os.path.join(DATA_DIR, get_env("PROMPT_LOG_FILE_NAME", "prompt_log.jsonl"))
 
 # ===== Логирование промптов =====
@@ -152,3 +153,10 @@ WEBAPP_PORT = _get_int("WEBAPP_PORT", 8080, minimum=1)
 # HTTP-клиент (aiohttp). total не ограничиваем: генерация может идти минуты; ограничиваем только паузу без данных.
 HTTP_SOCK_READ_TIMEOUT = _get_int("HTTP_SOCK_READ_TIMEOUT", 300, minimum=10)
 HTTP_SOCK_CONNECT_TIMEOUT = _get_int("HTTP_SOCK_CONNECT_TIMEOUT", 10, minimum=1)
+
+# ===== Проверка систем и админ-консоль =====
+STARTUP_CHECK = get_env("STARTUP_CHECK", "1") not in ("0", "false", "no")            # отчёт healthcheck при запуске
+STARTUP_CHECK_STRICT = get_env("STARTUP_CHECK_STRICT", "0") in ("1", "true", "yes")  # остановить запуск при критичных ошибках
+ADMIN_CONSOLE = get_env("ADMIN_CONSOLE", "1") not in ("0", "false", "no")            # терминальная админ-панель (только в TTY)
+WATCHDOG_INTERVAL = _get_int("WATCHDOG_INTERVAL", 60)   # секунд между проверками WebUI (0 — выключено); админам приходит оповещение о падении
+

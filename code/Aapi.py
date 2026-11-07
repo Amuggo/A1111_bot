@@ -5,6 +5,7 @@ import io
 import logging
 import re
 import json
+import os
 import random
 import time
 from typing import Awaitable, Dict, List, Optional, Callable, Tuple, Any
@@ -477,6 +478,148 @@ def get_last_adetailer_status() -> Dict[str, Any]:
     return _last_adetailer_status.get() or {"detected": 0, "detections": [], "models": []}
 
 
+# ===== FACEID (IP-Adapter через ControlNet): лицо участвует в самой генерации =====
+# В отличие от ReActor (замена лица ПОСЛЕ генерации), здесь эталонное лицо подаётся в ControlNet-юнит
+# IP-Adapter FaceID, и модель рисует картинку сразу с нужным лицом. Требуется: sd-webui-controlnet >= 1.1.428,
+# пакет insightface в venv WebUI, модель ip-adapter-faceid-plusv2_* в models/ControlNet и (желательно) её LoRA.
+
+class FaceIDUnavailable(Exception):
+    """В WebUI не хватает компонентов для FaceID (см. README, раздел «Лица»)."""
+
+
+_faceid_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
+_FACEID_TTL = 60.0
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+def _faceid_kind(name: str) -> str:
+    low = name.lower()
+    return "plusv2" if "plusv2" in low else ("plus" if "plus" in low else "base")
+
+
+async def get_faceid_setup(force: bool = False) -> Dict[str, Any]:
+    """
+    Проверяет, что WebUI готов к FaceID. Возвращает
+    {"ok", "reason", "model", "module", "lora", "unit_count"}. Результат кэшируется на минуту.
+    Переменные .env: FACEID_BASE (sd15|sdxl), FACEID_CN_MODEL, FACEID_MODULE, FACEID_LORA, FACEID_UNIT_COUNT.
+    """
+    now = time.monotonic()
+    if not force and _faceid_cache["data"] is not None and now - _faceid_cache["ts"] < _FACEID_TTL:
+        return _faceid_cache["data"]
+
+    info: Dict[str, Any] = {"ok": False, "reason": "", "model": None, "module": None, "lora": None, "unit_count": 1}
+
+    def _done() -> Dict[str, Any]:
+        _faceid_cache["ts"] = now
+        _faceid_cache["data"] = info
+        return info
+
+    try:
+        data = await sd_get_json("controlnet/model_list", timeout=10)
+        models = data.get("model_list", []) if isinstance(data, dict) else list(data or [])
+    except Exception as e:
+        info["reason"] = f"ControlNet API недоступен ({e}); установите расширение sd-webui-controlnet"
+        return _done()
+
+    base = os.environ.get("FACEID_BASE", "sd15").strip().lower()
+    model = os.environ.get("FACEID_CN_MODEL", "").strip()
+    if not model:
+        candidates = [m for m in models if "faceid" in m.lower() and "lora" not in m.lower() and base in m.lower()]
+        if not candidates:
+            info["reason"] = f"в models/ControlNet нет модели ip-adapter-faceid-plusv2_{base}"
+            return _done()
+        model = max(candidates, key=lambda m: (_faceid_kind(m) == "plusv2", _faceid_kind(m) == "plus"))
+
+    module = os.environ.get("FACEID_MODULE", "").strip() or (
+        "ip-adapter_face_id_plus" if "plus" in model.lower() else "ip-adapter_face_id")
+
+    lora = os.environ.get("FACEID_LORA", "").strip()
+    if not lora:
+        try:
+            loras = [item["id"] for item in await get_loras_list() if "faceid" in item["id"].lower() and base in item["id"].lower()]
+            loras.sort(key=lambda n: _faceid_kind(n) == _faceid_kind(model), reverse=True)
+            lora = loras[0] if loras else ""
+        except Exception as e:
+            print(f"⚠️ FaceID: не удалось получить список LoRA: {e}")
+
+    try:
+        unit_count = int(os.environ.get("FACEID_UNIT_COUNT", "").strip() or 0)
+        if not unit_count:
+            cn_settings = await sd_get_json("controlnet/settings", timeout=10)
+            unit_count = int(cn_settings.get("control_net_unit_count", 1))
+        info["unit_count"] = unit_count
+    except Exception:
+        pass  # оставляем 1: для обычной генерации этого достаточно
+
+    info.update(ok=True, model=model, module=module, lora=lora or None)
+    return _done()
+
+
+def inject_controlnet_unit(payload: dict, unit: dict) -> dict:
+    """Добавляет ControlNet-юнит в payload, не затирая уже существующие (например, позу)."""
+    scripts = dict(payload.get("alwayson_scripts") or {})
+    cn = dict(scripts.get("ControlNet") or {})
+    args = list(cn.get("args") or [])
+    args.append(unit)
+    cn["args"] = args
+    scripts["ControlNet"] = cn
+    payload["alwayson_scripts"] = scripts
+    return payload
+
+
+async def apply_faceid_to_payload(payload: dict, face_image: io.BytesIO,
+                                  status_callback: Optional[Callable[[str], Awaitable[None]]] = None,
+                                  weight: Optional[float] = None, lora_weight: Optional[float] = None) -> bool:
+    """Добавляет в payload ControlNet-юнит IP-Adapter FaceID и LoRA лица. Бросает FaceIDUnavailable, если WebUI не готов."""
+    setup = await get_faceid_setup()
+    if not setup["ok"]:
+        raise FaceIDUnavailable(setup["reason"])
+
+    face_image.seek(0)
+    face_b64 = await _b64encode(face_image.read())
+    unit = {
+        "input_image": face_b64,
+        "module": setup["module"],
+        "model": setup["model"],
+        "weight": weight if weight is not None else _env_float("FACEID_WEIGHT", 1.0),
+        "resize_mode": "Crop and Resize",
+        "low_vram": False,
+        "processor_res": 512,
+        "guidance_start": 0.0,
+        "guidance_end": 1.0,
+        "pixel_perfect": True,
+        "control_mode": "Balanced",
+    }
+    inject_controlnet_unit(payload, unit)
+
+    lw = lora_weight if lora_weight is not None else _env_float("FACEID_LORA_WEIGHT", 0.6)
+    # lw == 0 — LoRA лица выключена пользователем; уже стоящий в промпте тег (точный повтор) не трогаем
+    if setup["lora"] and lw > 0 and f"<lora:{setup['lora']}" not in payload.get("prompt", ""):
+        payload["prompt"] = f"{payload['prompt']}, <lora:{setup['lora']}:{lw}>"
+
+    print(f"🧠 FaceID: module={setup['module']}, model={setup['model']}, lora={setup['lora']}")
+    if status_callback:
+        await status_callback("🧠 FaceID: лицо учитывается прямо в генерации")
+    return True
+
+
+def _soften_adetailer_for_faceid(ad_block: dict) -> None:
+    """ADetailer перерисовывает лицо без IP-Adapter и может «сломать» сходство — ограничиваем силу перерисовки."""
+    try:
+        args = ad_block["args"][0]
+        cap = _env_float("FACEID_AD_DENOISE", 0.25)
+        if float(args.get("ad_denoising_strength", 0.4)) > cap:
+            args["ad_denoising_strength"] = cap
+    except Exception:
+        pass
+
+
 async def generate_txt2img(
     prompt: str, 
     user_id: str, 
@@ -486,7 +629,9 @@ async def generate_txt2img(
     fixed_seed: int = None,
     adetailer_overrides: Optional[dict] = None,
     exact_prompt: Optional[str] = None,
-    exact_negative: Optional[str] = None
+    exact_negative: Optional[str] = None,
+    face_image: Optional[io.BytesIO] = None,
+    face_weights: Optional[Tuple[float, float]] = None
 ) -> Tuple[List[io.BytesIO], int, str, str]:
     """
     Генерация изображений
@@ -519,7 +664,8 @@ async def generate_txt2img(
         if status_callback:
             await status_callback("🎨 Генерация изображения...")
         # Используем обработанный промпт для дальнейшей обработки
-        enhanced_prompt = await enhance_prompt_for_diversity(processed_prompt, user_id, user_settings)
+        # Фразы «разнообразия» («different face» и т.п.) противоречат FaceID — с эталонным лицом их не добавляем
+        enhanced_prompt = processed_prompt if face_image is not None else await enhance_prompt_for_diversity(processed_prompt, user_id, user_settings)
 
     # Используем фиксированный seed если передан, иначе случайный
     if fixed_seed is not None:
@@ -545,9 +691,17 @@ async def generate_txt2img(
         "n_iter": user_settings.get("n_iter", 1),
     }
 
+    # ===== FACEID: эталонное лицо идёт в саму генерацию (ControlNet IP-Adapter) =====
+    faceid_applied = False
+    if face_image is not None:
+        fw, lw = face_weights if face_weights else (None, None)
+        faceid_applied = await apply_faceid_to_payload(payload, face_image, status_callback, fw, lw)
+
     # ===== ADETAILER: автодетекция и перерисовка лиц/рук =====
     ad_block = await build_adetailer_script_args(user_id, adetailer_overrides)
     if ad_block:
+        if faceid_applied:
+            _soften_adetailer_for_faceid(ad_block)
         payload["alwayson_scripts"] = dict(payload.get("alwayson_scripts") or {})
         payload["alwayson_scripts"]["ADetailer"] = ad_block
         model_name = ad_block["args"][0].get("ad_model", "?")
@@ -571,8 +725,9 @@ async def generate_txt2img(
         image_bytes = base64.b64decode(img_base64)
         image_file = io.BytesIO(image_bytes)
         image_file.name = f"generation_{index}.png"
-        image_file.final_prompt = enhanced_prompt
+        image_file.final_prompt = payload["prompt"]  # с LoRA лица, если FaceID включён — для точного повтора
         image_file.final_negative = negative_prompt
+        image_file.faceid_used = faceid_applied
         images.append(image_file)
 
     return images, seed, original_prompt, processed_prompt
@@ -669,7 +824,11 @@ async def swap_face_with_reactor(
         "face_index": face_index
     }
     
-    if source_image is not None:
+    # select_source: 0 — исходное фото, 1 — сохранённая модель лица (models/reactor/faces/<имя>.safetensors)
+    use_model = bool(face_model) and face_model != "None"
+    payload["select_source"] = 1 if use_model else 0
+
+    if source_image is not None and not use_model:
         source_image.seek(0)
         source_base64 = await _b64encode(source_image.read())
         payload["source_image"] = source_base64
@@ -760,6 +919,31 @@ async def check_reactor_available() -> bool:
         except Exception:
             continue
     return False
+
+
+async def build_reactor_face_model(images: List[bytes], name: str, compute_method: int = 0) -> str:
+    """
+    Создаёт модель лица ReActor из одного или нескольких фото (POST /reactor/facemodels).
+    Расширение усредняет эмбеддинги лиц (compute_method: 0 — Mean, 1 — Median, 2 — Mode) и сохраняет
+    models/reactor/faces/<name>.safetensors на машине WebUI. Возвращает имя файла модели.
+    """
+    if not images:
+        raise ValueError("Нет изображений для модели лица")
+    encoded = ["data:image/jpeg;base64," + await _b64encode(raw) for raw in images]
+    payload = {"source_images": encoded, "name": name, "compute_method": int(compute_method)}
+    async with sd_gate.slot():  # ReActor считает эмбеддинги на том же GPU/CPU, что и генерация
+        await sd_post_json("reactor/facemodels", payload, timeout=180)
+
+    # Проверяем по списку моделей, под каким именем файла расширение сохранило результат
+    try:
+        info = await get_reactor_models()
+        for entry in info.get("facemodels", []):
+            base_name = os.path.basename(str(entry))
+            if os.path.splitext(base_name)[0] == name:
+                return base_name
+    except Exception as e:
+        print(f"⚠️ Не удалось проверить список моделей лиц: {e}")
+    return f"{name}.safetensors"
 
 
 # ===== IMG2IMG =====
@@ -923,7 +1107,9 @@ async def generate_image(
     status_callback: Optional[Callable[[str], None]] = None,
     fixed_seed: int = None,
     exact_prompt: Optional[str] = None,
-    exact_negative: Optional[str] = None
+    exact_negative: Optional[str] = None,
+    face_image: Optional[io.BytesIO] = None,
+    face_weights: Optional[Tuple[float, float]] = None
 ) -> Tuple[io.BytesIO, int, str, str]:
     """Генерация с возвратом изображения, seed, оригинального и обработанного промпта"""
     if user_id is None:
@@ -931,7 +1117,8 @@ async def generate_image(
 
     images, seed, original_prompt, processed_prompt = await generate_txt2img(
         prompt, user_id, user_settings, progress_callback, status_callback, fixed_seed,
-        exact_prompt=exact_prompt, exact_negative=exact_negative
+        exact_prompt=exact_prompt, exact_negative=exact_negative, face_image=face_image,
+        face_weights=face_weights
     )
 
     if not images:

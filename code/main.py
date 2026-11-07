@@ -1,4 +1,6 @@
 import bootstrap_env  # noqa: F401,E402  — ДОЛЖЕН идти первым: переключает скрипт на библиотеки из папки env/
+import logbuffer  # noqa: E402
+logbuffer.install()  # копит последние строки лога для /logs и пишет data/logs/bot.log
 import asyncio
 import base64
 import hashlib
@@ -18,7 +20,7 @@ from PIL import Image
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, PreCheckoutQuery
 
 from tg import BotAPI, types
 
@@ -30,7 +32,7 @@ except Exception as _seg_error:  # ImportError, а также AttributeError у 
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from Aapi import (
+from Aapi import ( 
     preprocess_prompt,
     generate_image, generate_txt2img_advanced, check_api_available,
     upscale_image, generate_img2img, swap_face_with_reactor,
@@ -44,13 +46,13 @@ from controlnet_manager import (
     generate_controlnet
 )
 from settings import (
-    get_user_settings, save_user_settings, get_user_negative_prompt,
+    get_user_settings, user_exists, save_user_settings, get_user_negative_prompt,
     DEFAULT_SETTINGS, DEFAULT_NEGATIVE_PROMPT, get_diversity_mode,
     get_prompt_processing_enabled, set_prompt_processing_enabled,
     set_diversity_mode, set_user_negative_prompt,
     get_user_lora_enabled, set_user_lora_enabled, get_available_loras,
-    set_available_loras, get_user_lora_enabled, set_user_lora_enabled,
-    fetch_loras_from_api,
+    set_available_loras, fetch_loras_from_api,
+    get_user_lora_weights, cycle_user_lora_weight,
     get_available_models, refresh_checkpoints_on_server, get_user_model,
     set_user_model, get_default_model, get_default_model_name,
     update_user_settings, get_available_embeddings, refresh_embeddings_on_server,
@@ -62,12 +64,16 @@ from face_manager import (
     save_user_face, get_user_faces, get_active_face, set_active_face,
     delete_face, get_face_preview, get_face_stats,
     check_reactor_available as check_reactor,
-    get_face_enabled, set_face_enabled, get_active_face_name
+    get_face_enabled, set_face_enabled, get_active_face_name,
+    FACE_MODES, FACE_MODE_LABELS, get_face_mode, set_face_mode, build_face_model,
+    get_face_context, apply_face_swap, face_features_available,
+    get_face_weights, cycle_face_weight, rename_face
 )
+from face_check import check_face_photo
 
+import subscriptions  # noqa: E402
 from task_queue import QueueFull, Task, TaskQueue  # noqa: E402
 from http_client import close_session  # noqa: E402
-from face_manager import rename_face  # noqa: E402
 import app_config as config  # noqa: E402  (загружает .env и переменные окружения)
 import prompt_logger  # noqa: E402  (логирование промптов пользователей)
 
@@ -112,6 +118,27 @@ dp = Dispatcher()
 task_queue: Optional[TaskQueue] = None
 
 
+# Тонкая настройка генерации — только для расширенного вида (администраторы, Pro; все — если подписки выключены).
+# Кнопки скрыты в меню, а здесь дополнительно блокируются старые сообщения с кнопками и подделанные callback'и.
+ADVANCED_CALLBACKS = {
+    "set_steps", "set_cfg", "set_sampler", "sampler_show_all", "set_neg", "neg_emb", "neg_reset", "neg_text",
+    "negemb_clear", "negemb_default", "negemb_noop", "negemb_refresh", "set_diversity", "set_hires",
+    "toggle_prompt_processing", "manage_lora", "refresh_lora_list",
+}
+ADVANCED_CALLBACK_PREFIXES = ("steps_", "cfg_", "sampler_set_", "hires_", "negemb_p_", "negemb_t_",
+                              "lora_toggle_", "lora_weight_", "ext_neg_")
+
+
+class AdvancedUIMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        callback = getattr(event, "data", None) or ""
+        if (callback in ADVANCED_CALLBACKS or callback.startswith(ADVANCED_CALLBACK_PREFIXES)) \
+                and not await subscriptions.advanced_allowed(str(event.from_user.id)):
+            await event.answer("🔒 Тонкая настройка доступна на тарифе Pro (/plan)", show_alert=True)
+            return None
+        return await handler(event, data)
+
+
 class RememberUserMiddleware(BaseMiddleware):
     """Запоминает @username авторов сообщений и нажатий кнопок ДО вызова хендлеров — для лога «пользователь : промпт»."""
 
@@ -122,6 +149,7 @@ class RememberUserMiddleware(BaseMiddleware):
 
 dp.message.outer_middleware(RememberUserMiddleware())
 dp.callback_query.outer_middleware(RememberUserMiddleware())
+dp.callback_query.outer_middleware(AdvancedUIMiddleware())
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -246,7 +274,16 @@ async def enqueue(chat_id, user_id, kind, job, reply_to_message_id=None):
         await bot.send_message(chat_id, "⚠️ Бот ещё запускается, повторите через несколько секунд.")
         return None
     try:
-        return await task_queue.submit(chat_id, user_id, kind, job, reply_to_message_id=reply_to_message_id)
+        # Тестовые подписки: дневной лимит по тарифу (если система включена админом)
+        denial = await subscriptions.check_and_consume(user_id)
+        if denial:
+            await bot.send_message(chat_id, denial, reply_to_message_id=reply_to_message_id)
+            return None
+        try:
+            return await task_queue.submit(chat_id, user_id, kind, job, reply_to_message_id=reply_to_message_id)
+        except QueueFull:
+            await subscriptions.refund(user_id)  # очередь полна — генерация не состоялась, лимит возвращаем
+            raise
     except QueueFull as error:
         await bot.send_message(chat_id, f"⚠️ {error}", reply_to_message_id=reply_to_message_id)
         return None
@@ -284,6 +321,18 @@ def _h(value):
 def _cut(text, limit):
     text = str(text)
     return text if len(text) <= limit else text[:limit - 1] + "…"
+
+def _face_caption_line(ctx, swapped) -> str:
+    """Строка подписи: как именно было применено лицо (FaceID в генерации и/или ReActor-замена)."""
+    if not ctx:
+        return ""
+    parts = []
+    if ctx.use_faceid:
+        fw, lw = ctx.weights or (None, None)
+        parts.append("FaceID (лицо задано при генерации" + (f", сила {fw}, LoRA {lw}" if fw is not None else "") + ")")
+    if swapped:
+        parts.append("ReActor-замена по модели" if ctx.model_file else "ReActor-замена")
+    return f"🎭 <b>Лицо:</b> {_h(', '.join(parts))}\n" if parts else ""
 
 def _text(message):
     """Текст сообщения или пустая строка (фото, стикер и т.п. раньше роняли обработчики на None.strip())."""
@@ -500,6 +549,10 @@ async def get_settings_inline_keyboard(settings, user_id):
     btn_model = types.InlineKeyboardButton(f"🧩 Модель: {model_label}", callback_data="set_model")
     markup.add(btn_model)
     markup.add(btn_res)
+    if not await subscriptions.advanced_allowed(user_id):
+        # Простой вид (Free): модель, размер, пресеты. Шаги, CFG, сэмплер, негатив, Hires, LoRA — на Pro
+        markup.add(types.InlineKeyboardButton("📦 Пресеты", callback_data="set_presets"))
+        return markup
     markup.add(btn_steps, btn_cfg)
     markup.add(btn_sampler, btn_neg)  # <--- Добавляем кнопку сэмплера
     markup.add(btn_diversity, btn_prompt)
@@ -649,14 +702,14 @@ async def handle_controlnet_category(call: CallbackQuery) -> None:
     if user_id in preview_messages:
         try:
             await bot.delete_message(call.message.chat.id, preview_messages[user_id])
-        except:
+        except Exception:
             pass
         del preview_messages[user_id]
 
     # Удаляем сообщение с категориями (текущее)
     try:
         await bot.delete_message(call.message.chat.id, call.message.message_id)
-    except:
+    except Exception:
         pass
 
     await show_controlnet_page(call.message, user_id, 0)
@@ -729,11 +782,11 @@ async def handle_controlnet_back_categories(call: CallbackQuery) -> None:
     if list_msg_id:
         try:
             await bot.delete_message(call.message.chat.id, list_msg_id)
-        except:
+        except Exception:
             pass
     try:
         await bot.delete_message(call.message.chat.id, call.message.message_id)
-    except:
+    except Exception:
         pass
     # Сбрасываем фильтр
     if user_id in pagination_data:
@@ -752,7 +805,7 @@ async def handle_controlnet_page(call: CallbackQuery) -> None:
         return
     try:
         page = int(call.data.split("_")[2])
-    except:
+    except Exception:
         await bot.answer_callback_query(call.id, "Ошибка")
         return
     if user_id not in pagination_data:
@@ -764,13 +817,13 @@ async def handle_controlnet_page(call: CallbackQuery) -> None:
     if old_list_id:
         try:
             await bot.delete_message(call.message.chat.id, old_list_id)
-        except:
+        except Exception:
             pass
         data['list_message_id'] = None
     # Удаляем текущее сообщение (это callback от кнопки навигации, оно тоже может быть удалено)
     try:
         await bot.delete_message(call.message.chat.id, call.message.message_id)
-    except:
+    except Exception:
         pass
     await show_controlnet_page(call.message, user_id, page)
     await bot.answer_callback_query(call.id)
@@ -811,12 +864,12 @@ async def handle_controlnet_refresh(call: CallbackQuery) -> None:
     # Удаляем старое сообщение списка (текущее)
     try:
         await bot.delete_message(call.message.chat.id, call.message.message_id)
-    except:
+    except Exception:
         pass
     if user_id in preview_messages:
         try:
             await bot.delete_message(call.message.chat.id, preview_messages[user_id])
-        except:
+        except Exception:
             pass
         del preview_messages[user_id]
 
@@ -828,7 +881,7 @@ async def handle_controlnet_preview(call: CallbackQuery) -> None:
     user_id = str(call.message.chat.id)
     try:
         idx = int(call.data.split("_")[2])
-    except:
+    except Exception:
         await bot.answer_callback_query(call.id, "Ошибка")
         return
     data = pagination_data.get(user_id)
@@ -852,20 +905,20 @@ async def handle_controlnet_preview(call: CallbackQuery) -> None:
     if list_msg_id:
         try:
             await bot.delete_message(call.message.chat.id, list_msg_id)
-        except:
+        except Exception:
             pass
         data['list_message_id'] = None
     # Удаляем текущее сообщение (кнопка предпросмотра) – оно уже не нужно
     try:
         await bot.delete_message(call.message.chat.id, call.message.message_id)
-    except:
+    except Exception:
         pass
 
     # Удаляем старое превью
     if user_id in preview_messages:
         try:
             await bot.delete_message(call.message.chat.id, preview_messages[user_id])
-        except:
+        except Exception:
             pass
         del preview_messages[user_id]
     
@@ -892,7 +945,7 @@ async def handle_controlnet_back_to_list(call: CallbackQuery) -> None:
     # Удаляем сообщение с превью
     try:
         await bot.delete_message(call.message.chat.id, call.message.message_id)
-    except:
+    except Exception:
         pass
     if user_id in preview_messages:
         del preview_messages[user_id]
@@ -910,7 +963,7 @@ async def handle_controlnet_use(call: CallbackQuery) -> None:
     user_id = str(call.message.chat.id)
     try:
         idx = int(call.data.split("_")[2])
-    except:
+    except Exception:
         await bot.answer_callback_query(call.id, "Ошибка")
         return
     data = pagination_data.get(user_id)
@@ -936,7 +989,7 @@ async def handle_controlnet_use(call: CallbackQuery) -> None:
     # Удаляем сообщение с превью
     try:
         await bot.delete_message(call.message.chat.id, call.message.message_id)
-    except:
+    except Exception:
         pass
     if user_id in preview_messages:
         del preview_messages[user_id]
@@ -966,7 +1019,7 @@ async def handle_controlnet_random(call: CallbackQuery) -> None:
     # Удаляем текущее сообщение с превью
     try:
         await bot.delete_message(call.message.chat.id, call.message.message_id)
-    except:
+    except Exception:
         pass
     if user_id in preview_messages:
         del preview_messages[user_id]
@@ -1066,6 +1119,9 @@ async def process_controlnet_prompt(message, user_id, source=None):
                 processed_prompt = f"{processed_prompt}, {lora_tags}"
                 await on_status(f"🎛️ Добавлены LoRA: {lora_tags}")
 
+            face_ctx = await get_face_context(user_id, need_controlnet_slot=True)
+            if face_ctx and face_ctx.note:
+                await on_status(f"⚠️ {face_ctx.note}")
             generated_image = await generate_txt2img_controlnet(
                 processed_prompt,  # используем обработанный промпт
                 control_image=control_img,
@@ -1074,16 +1130,19 @@ async def process_controlnet_prompt(message, user_id, source=None):
                 settings=settings,
                 progress_callback=on_progress,
                 status_callback=on_status,
-                user_id=user_id
+                user_id=user_id,
+                face_image=face_ctx.image if face_ctx and face_ctx.use_faceid else None,
+                face_weights=face_ctx.weights if face_ctx else None
             )
-            await on_status("🎭 Заменяю лицо...")
-            final_image = await apply_face_replacement_if_enabled(user_id, generated_image)
-            face_replaced = False
-            if REACTOR_AVAILABLE and await get_face_enabled(user_id) and await get_active_face(user_id):
-                face_replaced = True
+            final_image = generated_image
+            swapped = False
+            if face_ctx and face_ctx.use_swap:
+                await on_status("🎭 Заменяю лицо...")
+                final_image, swapped = await apply_face_swap(face_ctx, generated_image)
+            face_replaced = bool(face_ctx and (face_ctx.use_faceid or swapped))
             try:
                 await bot.delete_message(message.chat.id, task.status_message_id)
-            except:
+            except Exception:
                 pass
         
             # Формируем капшн с полной информацией
@@ -1097,8 +1156,7 @@ async def process_controlnet_prompt(message, user_id, source=None):
                 f"🎚️ <b>CFG:</b> {settings.get('cfg_scale', 7.0)}\n"
                 f"🎲 <b>Seed:</b> <code>{getattr(generated_image, 'seed', 'N/A')}</code>\n"
             )
-            if face_replaced:
-                caption += "🎭 <b>Лицо заменено</b>\n"
+            caption += _face_caption_line(face_ctx, swapped)
             sent_msg = await send_image_smart(message.chat.id, final_image, caption=caption, parse_mode="HTML")
             last_images[user_id] = final_image
             last_message_ids[user_id] = sent_msg.message_id
@@ -1279,7 +1337,12 @@ async def handle_same_skeleton(call: CallbackQuery) -> None:
 
 @router.message(Command("start", "help"))
 async def send_welcome(message: Message) -> None:
-    await get_user_settings(str(message.chat.id))
+    uid = str(message.chat.id)
+    is_new = not await user_exists(uid)  # до get_user_settings: он создаёт запись пользователя
+    await get_user_settings(uid)
+    parts = (message.text or "").split(maxsplit=1)
+    if is_new and len(parts) == 2 and parts[1].startswith("ref_"):
+        await _handle_referral_start(message, parts[1][4:])
     await bot.send_message(
         message.chat.id,
         "🤖 **Stable Diffusion Бот**\n\n📝 **Быстрая генерация:** просто отправь любой текст\n\n🚀 **Сгенерировать** - расширенный режим\n⚙️ **Настройки** - изменить параметры\n🔍 **Апскейл** - увеличить картинку (или просто пришли мне любое фото)\n🧩 **Модель** - выбор в настройках или командой /model\n🎭 **Управление лицом** - добавление нескольких лиц для замены",
@@ -1304,6 +1367,16 @@ async def show_settings(message: Message) -> None:
     model_display = await _model_display_name(user_id)
     plan = hires_plan(settings)
     hires_line = f"🔬 Hires: ✅ {plan['scale']}x → {plan['width']}×{plan['height']}\n" if plan else "🔬 Hires: ❌ выкл\n"
+    if not await subscriptions.advanced_allowed(user_id):
+        simple_text = (
+            "🎛️ **Настройки:**\n\n"
+            f"🧩 Модель: `{model_display.replace('`', '')}`\n"
+            f"📐 Размер: {settings['width']}x{settings['height']}\n\n"
+            "🔒 Тонкая настройка (шаги, CFG, сэмплер, негатив, Hires, LoRA) доступна на тарифе Pro — /plan"
+        )
+        await bot.send_message(message.chat.id, simple_text, parse_mode="Markdown",
+                               reply_markup=await get_settings_inline_keyboard(settings, user_id))
+        return
     text = (
         "🎛️ **Текущие настройки:**\n\n"
         f"📐 Размер: {settings['width']}x{settings['height']}\n"
@@ -1327,33 +1400,51 @@ async def ask_for_upscale(message: Message) -> None:
 
 @router.message(F.text == "🎭 Управление лицом")
 async def face_management(message: Message) -> None:
-    if not REACTOR_AVAILABLE:
-        await bot.reply_to(message, "❌ Функция замены лиц временно недоступна. Попробуйте позже.")
+    if not await face_features_available():
+        await bot.reply_to(message, "❌ Функция лиц недоступна: в WebUI не найден ни ReActor, ни FaceID (ControlNet). Подробности — в README, раздел «Лица».")
         return
     user_id = str(message.chat.id)
     stats = await get_face_stats(user_id)
     face_enabled = await get_face_enabled(user_id)
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    buttons = []
-    status_text = "✅ Включена" if face_enabled else "❌ Выключена"
-    buttons.append(types.InlineKeyboardButton(f"🎭 Замена лиц: {status_text}", callback_data="face_toggle_main"))
-    buttons.append(types.InlineKeyboardButton("📸 Добавить новое лицо", callback_data="face_add"))
+    mode = await get_face_mode(user_id)
+    faces = await get_user_faces(user_id)
+    models_count = sum(1 for f in faces if f.get("model"))
+    fw, lw = await get_face_weights(user_id)
+    try:
+        from Aapi import get_faceid_setup
+        setup = await get_faceid_setup()
+    except Exception as e:
+        setup = {"ok": False, "reason": str(e)}
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    status_text = "✅ Включено" if face_enabled else "❌ Выключено"
+    buttons = [
+        types.InlineKeyboardButton(f"🎭 Лицо в генерации: {status_text}", callback_data="face_toggle_main"),
+        types.InlineKeyboardButton(f"🧠 Режим: {FACE_MODE_LABELS[mode]}", callback_data="face_mode_cycle"),
+        types.InlineKeyboardButton(f"🎚️ Сила лица (FaceID): {fw:g}", callback_data="face_weight_faceid"),
+        types.InlineKeyboardButton(f"🧴 Вес LoRA лица: {'выкл.' if lw <= 0 else format(lw, 'g')}", callback_data="face_weight_lora"),
+        types.InlineKeyboardButton("📸 Добавить новое лицо", callback_data="face_add"),
+        types.InlineKeyboardButton("🧬 Модель лица из нескольких фото", callback_data="face_model_new"),
+    ]
     if stats["total_faces"] > 0:
         buttons.append(types.InlineKeyboardButton("📋 Список лиц", callback_data="face_list"))
     markup.add(*buttons)
-    active_face = stats.get("active_face", "не выбрано")
+    active_face = stats.get("active_face") or "не выбрано"
+    faceid_line = "✅ готов" if setup.get("ok") else f"⚠️ не готов: {_h(setup.get('reason') or '—')}"
     info_text = (
-        "🎭 **Управление лицами**\n\n"
-        f"📸 **Всего лиц:** {stats['total_faces']}\n"
-        f"⭐ **Активное лицо:** {active_face}\n\n"
-        "💡 **Как работает:**\n"
-        "1. Добавьте одно или несколько лиц\n"
-        "2. Выберите активное лицо\n"
-        "3. Включите замену лиц\n"
-        "4. Генерируйте изображения - лица будут заменены!\n\n"
-        "✨ **Совет:** Для лучшего качества используйте фото с хорошим освещением"
+        "🎭 <b>Управление лицами</b>\n\n"
+        f"📸 <b>Всего лиц:</b> {stats['total_faces']} (с моделью ReActor: {models_count})\n"
+        f"⭐ <b>Активное лицо:</b> {_h(active_face)}\n"
+        f"🧠 <b>FaceID:</b> {faceid_line}\n"
+        f"🎚️ <b>Сила лица:</b> {fw:g} · <b>LoRA:</b> {'выкл.' if lw <= 0 else format(lw, 'g')}\n\n"
+        "💡 <b>Режимы:</b>\n"
+        "🔁 <b>Замена после генерации</b> — ReActor подменяет лицо на готовой картинке (по модели лица, если она создана).\n"
+        "🧠 <b>FaceID в генерации</b> — лицо задаётся прямо при генерации (IP-Adapter), без замены.\n"
+        "🧠+🔁 <b>Оба</b> — FaceID, а сверху ReActor для максимального сходства.\n\n"
+        "🎚️ Сила лица — насколько жёстко FaceID держит сходство (выше — похожее, но «деревянное»; ниже — живее). "
+        "LoRA лица усиливает сходство, обычно 0.5–0.7.\n\n"
+        "✨ Для лучшего результата используйте чёткие фото анфас; модель из 3–10 фото точнее, чем из одного."
     )
-    await bot.send_message(message.chat.id, info_text, parse_mode="Markdown", reply_markup=markup)
+    await bot.send_message(message.chat.id, info_text, parse_mode="HTML", reply_markup=markup)
 
 # =========== СТАТИСТИКА ЛОГА ПРОМПТОВ ===========
 # (Обработчик должен быть зарегистрирован ДО универсального текстового обработчика ниже —
@@ -1362,8 +1453,7 @@ async def face_management(message: Message) -> None:
 @router.message(Command('prompts'))
 async def show_prompt_log(message: Message) -> None:
     """Показывает последние записями из лога промптов (для администратора)."""
-    admin_id = os.environ.get("ADMIN_USER_ID")
-    if admin_id and str(message.chat.id) != admin_id:
+    if not await subscriptions.is_admin(str(message.chat.id)):
         await bot.reply_to(message, "⛔ Доступ только для администратора (задайте ADMIN_USER_ID в .env).")
         return
     records = await prompt_logger.tail(limit=15)
@@ -1619,6 +1709,222 @@ async def handle_photo_upscale_callback(call: CallbackQuery) -> None:
 
 # =========== ОТМЕНА ЗАДАЧ ===========
 
+# =========== АДМИН-ПАНЕЛЬ В TELEGRAM ===========
+# Доступ по числовому id: ADMIN_USER_ID (владелец, всё) и ADMIN_USER_IDS (просмотр и безопасные действия).
+# Команды те же, что в терминале: см. admin_console.HELP; /adm <команда> выполняет любую.
+
+ADMIN_MENU = {
+    "adm_status": "status", "adm_check": "check", "adm_queue": "queue", "adm_users": "users",
+    "adm_sub": "sub status", "adm_payments": "sub payments", "adm_logs": "logs 40", "adm_errors": "logs errors",
+    "adm_logfile": "logs file", "adm_admins": "admin list", "adm_interrupt": "interrupt", "adm_reload": "reload",
+}
+
+def _admin_menu_markup(level: str):
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(
+        types.InlineKeyboardButton("📊 Статус", callback_data="adm_status"),
+        types.InlineKeyboardButton("🩺 Проверка систем", callback_data="adm_check"),
+        types.InlineKeyboardButton("📋 Очередь", callback_data="adm_queue"),
+        types.InlineKeyboardButton("👥 Пользователи", callback_data="adm_users"),
+        types.InlineKeyboardButton("💳 Подписки", callback_data="adm_sub"),
+        types.InlineKeyboardButton("💰 Платежи", callback_data="adm_payments"),
+        types.InlineKeyboardButton("📜 Логи", callback_data="adm_logs"),
+        types.InlineKeyboardButton("🚨 Ошибки", callback_data="adm_errors"),
+        types.InlineKeyboardButton("📎 Лог-файл", callback_data="adm_logfile"),
+        types.InlineKeyboardButton("🛡️ Админы", callback_data="adm_admins"),
+        types.InlineKeyboardButton("⏹ Прервать генерацию", callback_data="adm_interrupt"),
+        types.InlineKeyboardButton("🔄 Обновить кэши", callback_data="adm_reload"),
+    )
+    if level == "owner":
+        m.add(types.InlineKeyboardButton("🛑 Остановить бота", callback_data="adm_quit"))
+    return m
+
+async def _send_admin_output(chat_id: int, text: str, tail: bool = False, filename: str = "output.txt") -> None:
+    """Короткий вывод — сообщением (<pre>), длинный — файлом; логи — последние 3500 символов."""
+    text = text or "✅ Готово"
+    if len(text) <= 3500:
+        await bot.send_message(chat_id, f"<pre>{_h(text)}</pre>", parse_mode="HTML")
+    elif tail:
+        await bot.send_message(chat_id, f"<pre>…\n{_h(text[-3500:])}</pre>", parse_mode="HTML")
+    else:
+        buf = io.BytesIO(text.encode("utf-8"))
+        buf.name = filename
+        await bot.send_document(chat_id, buf, caption="📄 Результат длинный — во вложении")
+
+async def _run_admin_line(chat_id: int, line: str, level: str) -> None:
+    import admin_console
+    parts = line.split()
+    if parts[:1] == ["logs"] and parts[1:2] == ["file"]:
+        path = logbuffer.log_file_path()
+        if path is None:
+            await bot.send_message(chat_id, "ℹ️ Файл лога не создан (LOG_TO_FILE=0 или нет прав на запись).")
+            return
+        with open(path, "rb") as f:
+            buf = io.BytesIO(f.read())
+        buf.name = "bot.log"
+        await bot.send_document(chat_id, buf, caption="📎 Лог бота (токены скрыты, промпты пользователей — как есть)")
+        return
+    if parts[:1] == ["check"]:
+        await bot.send_message(chat_id, "⏳ Проверяю системы...")
+    text = await admin_console.run_capture(line, _build_console_context(reply_chat_id=chat_id, actor=str(chat_id)), level)
+    await _send_admin_output(chat_id, text, tail=parts[:1] == ["logs"],
+                             filename="healthcheck.txt" if parts[:1] == ["check"] else "output.txt")
+    if parts[:1] == ["broadcast"] and parts[1:2] and parts[1].lower() in admin_console.AUDIENCES and admin_console.has_pending_broadcast():
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(types.InlineKeyboardButton("📣 Отправить", callback_data="adm_bc_send"),
+                   types.InlineKeyboardButton("Отмена", callback_data="adm_bc_cancel"))
+        await bot.send_message(chat_id, "Отправить рассылку?", reply_markup=markup)
+
+@router.message(Command("admin"))
+async def admin_panel(message: Message) -> None:
+    level = await subscriptions.admin_level(str(message.chat.id))
+    if not level:
+        await bot.reply_to(message, "⛔ Доступ только для администраторов (ADMIN_USER_ID / ADMIN_USER_IDS в .env).")
+        return
+    role = "владелец" if level == "owner" else "администратор (просмотр и безопасные действия)"
+    await bot.send_message(
+        message.chat.id,
+        f"🛠️ <b>Админ-панель</b>\nРоль: {role}\n\nЛюбую команду консоли можно выполнить так: <code>/adm sub list</code>. Справка: <code>/adm help</code>\nРассылка (владелец): <code>/adm broadcast all Текст</code>",
+        parse_mode="HTML", reply_markup=_admin_menu_markup(level))
+
+@router.message(Command("adm"))
+async def admin_command(message: Message) -> None:
+    level = await subscriptions.admin_level(str(message.chat.id))
+    if not level:
+        await bot.reply_to(message, "⛔ Доступ только для администраторов.")
+        return
+    await _run_admin_line(message.chat.id, (message.text or "").partition(" ")[2].strip() or "help", level)
+
+@router.callback_query(F.data.startswith("adm_"))
+async def admin_callback(call: CallbackQuery) -> None:
+    level = await subscriptions.admin_level(str(call.from_user.id))
+    if not level:
+        await _safe_answer(call, "Нет доступа", show_alert=True)
+        return
+    await _safe_answer(call)
+    chat_id = call.message.chat.id
+    if call.data == "adm_quit":
+        if level != "owner":
+            await bot.send_message(chat_id, "⛔ Остановка доступна только владельцу.")
+            return
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(types.InlineKeyboardButton("🛑 Да, остановить", callback_data="adm_quit_yes"),
+                   types.InlineKeyboardButton("Отмена", callback_data="adm_cancel"))
+        await bot.send_message(chat_id, "⚠️ Бот остановится и сам не запустится, пока вы не стартуете его вручную или службой. Остановить?", reply_markup=markup)
+    elif call.data == "adm_quit_yes":
+        await _run_admin_line(chat_id, "quit", level)
+    elif call.data == "adm_cancel":
+        await bot.send_message(chat_id, "Отменено.")
+    elif call.data in ("adm_bc_send", "adm_bc_cancel"):
+        if level != "owner":
+            await bot.send_message(chat_id, "⛔ Рассылки доступны только владельцу.")
+            return
+        await _run_admin_line(chat_id, "broadcast send" if call.data == "adm_bc_send" else "broadcast cancel", level)
+    elif call.data in ADMIN_MENU:
+        await _run_admin_line(chat_id, ADMIN_MENU[call.data], level)
+
+_BOT_USERNAME: Optional[str] = None
+
+async def _bot_username() -> Optional[str]:
+    global _BOT_USERNAME
+    if _BOT_USERNAME is None:
+        try:
+            _BOT_USERNAME = (await bot.get_me()).username
+        except Exception as e:
+            print(f"⚠️ Не удалось получить username бота: {e}")
+    return _BOT_USERNAME
+
+async def _notify_admin(text: str) -> None:
+    """Платёжные уведомления — только владельцу."""
+    await _notify_admins(text, owner_only=True)
+
+async def _handle_referral_start(message: Message, referrer: str) -> None:
+    """/start ref_<id>: бонус новому пользователю и пригласившему (только если пригласивший уже пользуется ботом)."""
+    uid = str(message.chat.id)
+    if not referrer.isdigit() or not await user_exists(referrer):
+        return
+    result = await subscriptions.register_referral(uid, referrer, is_new=True)
+    if not result["ok"]:
+        return
+    if result["credits"]:
+        await bot.send_message(message.chat.id, f"🎁 Вы пришли по приглашению — вам начислено {result['credits']} бонусных генераций!")
+        try:
+            await bot.send_message(int(referrer), f"🎁 По вашей ссылке пришёл новый пользователь — вам {result['credits']} бонусных генераций. /plan")
+        except Exception as e:
+            print(f"⚠️ Не удалось уведомить пригласившего: {e}")
+
+@router.message(Command("plan"))
+async def plan_command(message: Message):
+    """/plan — тариф, лимиты, бонусы, кнопки оплаты (если админ включил оплату) и реферальная ссылка."""
+    uid = str(message.chat.id)
+    text = await subscriptions.describe(uid, await _bot_username())
+    markup = None
+    if await subscriptions.is_enabled() and await subscriptions.payments_enabled():
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(*[types.InlineKeyboardButton(f"⭐ {p['title']} — {p['stars']}", callback_data=f"buy_{key}")
+                     for key, p in subscriptions.PRODUCTS.items()])
+    await bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+@router.message(Command("invite"))
+async def invite_command(message: Message):
+    await bot.send_message(message.chat.id, await subscriptions.describe_referral(str(message.chat.id), await _bot_username()), parse_mode="HTML")
+
+@router.message(Command("paysupport"))
+async def paysupport_command(message: Message):
+    """/paysupport — обязательная для платёжных ботов команда поддержки по платежам."""
+    contact = os.environ.get("SUPPORT_CONTACT", "").strip()
+    text = ("💬 <b>Поддержка по платежам</b>\n\nЕсли оплата не сработала или нужен возврат, напишите администратору "
+            "и приложите номер платежа из чека Telegram. Возврат Stars выполняется по решению администратора.")
+    if contact:
+        text += f"\nКонтакт: {_h(contact)}"
+    await bot.send_message(message.chat.id, text, parse_mode="HTML")
+
+@router.callback_query(F.data.startswith("buy_"))
+async def handle_buy(call: CallbackQuery) -> None:
+    product = subscriptions.PRODUCTS.get(call.data[len("buy_"):])
+    if not product or not (await subscriptions.is_enabled() and await subscriptions.payments_enabled()):
+        await _safe_answer(call, "Оплата сейчас недоступна", show_alert=True)
+        return
+    await _safe_answer(call)
+    uid = call.message.chat.id
+    await bot.send_invoice(uid, title=f"Подписка {product['title']}",
+                           description=f"Тариф Pro: без дневного лимита и с функциями лиц. Срок: {product['days']} дн.",
+                           payload=f"sub:{call.data[len('buy_'):]}:{uid}", stars=product["stars"], label=product["title"])
+
+@router.pre_checkout_query()
+async def handle_pre_checkout(query: PreCheckoutQuery) -> None:
+    """Telegram спрашивает подтверждение перед списанием: проверяем товар, сумму, владельца счёта и включённую оплату."""
+    parts = query.invoice_payload.split(":")
+    product = subscriptions.PRODUCTS.get(parts[1]) if len(parts) == 3 else None
+    valid = bool(product and parts[0] == "sub" and parts[2] == str(query.from_user.id) and query.currency == "XTR"
+                 and query.total_amount == product["stars"]
+                 and await subscriptions.is_enabled() and await subscriptions.payments_enabled())
+    await query.answer(ok=valid, error_message=None if valid else "Покупка сейчас недоступна, попробуйте позже.")
+
+@router.message(F.successful_payment)
+async def handle_successful_payment(message: Message) -> None:
+    pay = message.successful_payment
+    uid = str(message.chat.id)
+    parts = pay.invoice_payload.split(":")
+    result = await subscriptions.process_payment(uid, parts[1] if len(parts) == 3 else "", pay.total_amount,
+                                                 pay.telegram_payment_charge_id)
+    charge = _h(pay.telegram_payment_charge_id)
+    if not result["ok"]:
+        await bot.send_message(message.chat.id, f"⚠️ Платёж получен, но не обработан автоматически. Напишите в /paysupport и укажите номер платежа: <code>{charge}</code>", parse_mode="HTML")
+        await _notify_admin(f"❗ Необработанный платёж от {uid}: {_h(result.get('reason', '?'))}\n<code>{charge}</code>")
+        return
+    if result.get("duplicate"):
+        return
+    product = result["product"]
+    await bot.send_message(message.chat.id, f"✅ Оплата получена! Тариф <b>Pro</b> {subscriptions.fmt_expires(result['expires'])}. Спасибо! 🎉", parse_mode="HTML")
+    await _notify_admin(f"💰 Оплата: пользователь {uid}, {_h(product['title'])}, {pay.total_amount}⭐\n<code>{charge}</code>")
+    reward = result.get("reward")
+    if reward:
+        try:
+            await bot.send_message(int(reward["referrer"]), f"🎁 Ваш приглашённый оформил подписку — вам +{reward['days']} дн. Pro ({subscriptions.fmt_expires(reward['expires'])}). Спасибо!")
+        except Exception as e:
+            print(f"⚠️ Не удалось уведомить пригласившего: {e}")
+
 @router.message(Command("cancel"))
 async def cancel_command(message: Message):
     """/cancel — отменяет все задачи пользователя (в очереди и выполняющиеся) и ожидание ввода текста."""
@@ -1802,31 +2108,23 @@ async def handle_quick_generation(message: Message) -> None:
         start_time = time.time()
         on_progress, on_status = make_callbacks(task)
         try:
+            face_ctx = await get_face_context(user_id)
+            if face_ctx and face_ctx.note:
+                await on_status(f"⚠️ {face_ctx.note}")
             image_file, used_seed, original_prompt, processed_prompt = await generate_image(
-                prompt, settings, user_id, on_progress, on_status, fixed_seed=None
+                prompt, settings, user_id, on_progress, on_status, fixed_seed=None,
+                face_image=face_ctx.image if face_ctx and face_ctx.use_faceid else None,
+                face_weights=face_ctx.weights if face_ctx else None
             )
             final_image_file = image_file
-            face_replacement_success = False
-            if REACTOR_AVAILABLE and await get_face_enabled(user_id):
-                active_face = await get_active_face(user_id)
-                if active_face:
-                    try:
-                        await on_status("🎭 Заменяю лицо...")
-                        final_image_file = await swap_face_with_reactor(
-                            source_image=active_face,
-                            target_image=image_file,
-                            face_model="None",
-                            upscaler="None",
-                            face_restorer="GFPGAN",
-                            restorer_visibility=1.0
-                        )
-                        face_replacement_success = True
-                    except Exception as e:
-                        print(f"Ошибка замены лица: {e}")
-                        final_image_file = image_file
+            swapped = False
+            if face_ctx and face_ctx.use_swap:
+                await on_status("🎭 Заменяю лицо...")
+                final_image_file, swapped = await apply_face_swap(face_ctx, image_file)
+            face_replacement_success = bool(face_ctx and (face_ctx.use_faceid or swapped))
             try:
                 await bot.delete_message(message.chat.id, task.status_message_id)
-            except:
+            except Exception:
                 pass
             caption = (
                 f"✨ <b>Исходный промпт:</b>\n<code>{_h(_cut(original_prompt, 700))}</code>\n\n"
@@ -1839,8 +2137,7 @@ async def handle_quick_generation(message: Message) -> None:
                 + (f"🔬 <b>Hires:</b> {hires_plan(settings)['scale']}x → {hires_plan(settings)['width']}×{hires_plan(settings)['height']}\n"
                    if hires_plan(settings) else "")
             )
-            if face_replacement_success:
-                caption += "🎭 <b>Лицо заменено</b>\n"
+            caption += _face_caption_line(face_ctx, swapped)
             # Фото либо файл (если не проходит по весу/разрешению), подпись длиннее 1024 — отдельным сообщением
             sent_msg = await send_image_smart(message.chat.id, final_image_file, caption=caption, parse_mode="HTML",
                                         reply_to_message_id=message.message_id)
@@ -1885,7 +2182,25 @@ async def handle_face_toggle_main(call: CallbackQuery) -> None:
     new_state = not current
     await set_face_enabled(user_id, new_state)
     status = "включена ✅" if new_state else "выключена ❌"
-    await bot.answer_callback_query(call.id, f"Замена лиц {status}")
+    await bot.answer_callback_query(call.id, f"Лицо в генерации {status}")
+    await face_management(call.message)
+
+@router.callback_query(F.data.in_({"face_weight_faceid", "face_weight_lora"}))
+async def handle_face_weight(call: CallbackQuery) -> None:
+    user_id = str(call.message.chat.id)
+    kind = "faceid" if call.data == "face_weight_faceid" else "lora"
+    value = await cycle_face_weight(user_id, kind)
+    label = "Сила лица" if kind == "faceid" else "Вес LoRA лица"
+    await _safe_answer(call, f"{label}: {'выкл.' if kind == 'lora' and value <= 0 else format(value, 'g')}")
+    await face_management(call.message)
+
+@router.callback_query(F.data == "face_mode_cycle")
+async def handle_face_mode_cycle(call: CallbackQuery) -> None:
+    user_id = str(call.message.chat.id)
+    current = await get_face_mode(user_id)
+    new_mode = FACE_MODES[(FACE_MODES.index(current) + 1) % len(FACE_MODES)]
+    await set_face_mode(user_id, new_mode)
+    await _safe_answer(call, f"Режим: {FACE_MODE_LABELS[new_mode]}")
     await face_management(call.message)
 
 @router.callback_query(F.data == "face_add")
@@ -1919,6 +2234,11 @@ async def save_new_face(message, original_chat_id):
         except Exception:
             await bot.send_message(message.chat.id, "❌ Не удалось прочитать изображение. Отправьте фото в формате JPG/PNG.")
             return
+        ok, reason = await check_face_photo(jpeg_bytes)
+        if not ok:
+            await bot.send_message(message.chat.id, f"❌ {reason}\nОтправьте другое фото.")
+            register_next_step(message.chat.id, save_new_face, original_chat_id)
+            return
         temp_face = io.BytesIO(jpeg_bytes)
         temp_data.setdefault(user_id, {})['temp_face'] = temp_face
         msg = await bot.send_message(message.chat.id, "✏️ **Введите имя для этого лица**\n\nНапример: 'я', 'друг', 'коллега' и т.д.\n\nИли отправьте 'default' для стандартного имени.", parse_mode="Markdown")
@@ -1949,6 +2269,7 @@ async def set_face_name(message, original_chat_id):
             preview = await get_face_preview(user_id, face_name)
             if preview:
                 await bot.send_photo(message.chat.id, preview, caption=f"📸 {face_name}")
+            await _build_model_and_report(message.chat.id, user_id, face_name)
         else:
             await bot.send_message(message.chat.id, "❌ Ошибка при сохранении лица.")
         temp_data.get(user_id, {}).pop('temp_face', None)
@@ -1969,12 +2290,6 @@ def _face_id(face_name):
 async def _find_face_by_id(user_id, face_id):
     faces = await get_user_faces(user_id)
     return next((f for f in faces if _face_id(f["name"]) == face_id), None)
-
-async def _safe_answer(call, text=None, show_alert=False):
-    try:
-        await bot.answer_callback_query(call.id, text, show_alert=show_alert)
-    except Exception:
-        pass  # на один callback можно ответить только один раз
 
 async def _replace_message(call, text, markup=None):
     """Заменяет сообщение с кнопками на текстовое (работает и для фото-сообщений)."""
@@ -2009,7 +2324,7 @@ async def handle_face_list(call: CallbackQuery) -> None:
         await _safe_answer(call)
         return
     for face in faces:
-        status = "⭐ " if face["is_active"] else "📸 "
+        status = ("⭐ " if face["is_active"] else "📸 ") + ("🧬 " if face.get("model") else "")
         markup.add(types.InlineKeyboardButton(f"{status}{face['name']}", callback_data=f"face_select_{_face_id(face['name'])}"))
     markup.add(types.InlineKeyboardButton("◀️ Назад", callback_data="face_back"))
     await _replace_message(call, "📋 <b>Список ваших лиц</b>\n\nВыберите лицо для управления:", markup)
@@ -2027,6 +2342,9 @@ async def handle_face_select(call: CallbackQuery) -> None:
     markup = types.InlineKeyboardMarkup(row_width=2)
     if not face["is_active"]:
         markup.add(types.InlineKeyboardButton("⭐ Сделать активным", callback_data=f"face_activate_{fid}"))
+    markup.add(types.InlineKeyboardButton(
+        "🧬 Пересоздать модель ReActor" if face.get("model") else "🧬 Создать модель ReActor",
+        callback_data=f"face_mkmodel_{fid}"))
     markup.add(
         types.InlineKeyboardButton("✏️ Переименовать", callback_data=f"face_rename_{fid}"),
         types.InlineKeyboardButton("🗑️ Удалить", callback_data=f"face_delete_{fid}"),
@@ -2034,7 +2352,8 @@ async def handle_face_select(call: CallbackQuery) -> None:
     )
     preview = await get_face_preview(user_id, face_name)
     status_text = "⭐ Активно" if face["is_active"] else "📸 Не активно"
-    caption = f"<b>{html.escape(face_name)}</b>\n{status_text}"
+    model_text = "🧬 Модель ReActor создана" if face.get("model") else "▫️ Модели ReActor нет"
+    caption = f"<b>{html.escape(face_name)}</b>\n{status_text}\n{model_text}"
     if preview:
         await bot.send_photo(call.message.chat.id, preview, caption=caption, parse_mode="HTML", reply_markup=markup)
         try:
@@ -2120,6 +2439,136 @@ async def handle_face_confirm_delete(call: CallbackQuery) -> None:
 @router.callback_query(F.data == "face_back")
 async def handle_face_back(call: CallbackQuery) -> None:
     await face_management(call.message)
+
+# --- Модели лиц ReActor ----------------------------------------------------
+# Модель лица — это .safetensors с усреднённым эмбеддингом лица (models/reactor/faces на стороне WebUI).
+# ReActor применяет её быстрее и стабильнее, чем разбор исходного фото при каждой замене.
+
+MODEL_MAX_PHOTOS = 10
+_model_sessions: dict = {}   # user_id -> {"name": str, "photos": [jpeg bytes]}
+
+async def _build_model_and_report(chat_id, user_id, face_name, extra_images=None, quiet_unavailable=True):
+    """Строит модель ReActor и сообщает результат. Ошибки не роняют сценарий: лицо остаётся доступным как фото."""
+    if not await check_reactor():
+        if not quiet_unavailable:
+            await bot.send_message(chat_id, "⚠️ ReActor недоступен — модель лица создать нельзя (лицо сохранено как фото).")
+        return False
+    status = await bot.send_message(chat_id, "🧬 Создаю модель лица ReActor...")
+    try:
+        model_file = await build_face_model(user_id, face_name, extra_images)
+        text = f"🧬 <b>Модель лица создана:</b> <code>{_h(model_file)}</code>\nТеперь замена будет идти по модели."
+        ok = True
+    except Exception as e:
+        text = f"⚠️ Не удалось создать модель ReActor: {_h(_cut(e, 500))}\nЛицо сохранено, замена пойдёт по фото."
+        ok = False
+    try:
+        await bot.edit_message_text(text, chat_id, status.message_id, parse_mode="HTML")
+    except Exception:
+        await bot.send_message(chat_id, text, parse_mode="HTML")
+    return ok
+
+async def _download_face_jpeg(message) -> Optional[bytes]:
+    """Скачивает фото (или картинку-файл) из сообщения и приводит к JPEG. None — если это не изображение."""
+    document = getattr(message, "document", None)
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif document and (getattr(document, "mime_type", None) or "").startswith("image/"):
+        file_id = document.file_id
+    else:
+        return None
+    file_info = await bot.get_file(file_id)
+    raw = await bot.download_file(file_info.file_path)
+
+    def to_jpeg(data: bytes) -> bytes:
+        with Image.open(io.BytesIO(data)) as img:
+            out = io.BytesIO()
+            img.convert("RGB").save(out, format="JPEG", quality=95)
+            return out.getvalue()
+
+    try:
+        return await asyncio.to_thread(to_jpeg, raw if isinstance(raw, bytes) else raw.read())
+    except Exception:
+        return None
+
+@router.callback_query(F.data.startswith("face_mkmodel_"))
+async def handle_face_mkmodel(call: CallbackQuery) -> None:
+    user_id = str(call.message.chat.id)
+    face = await _find_face_by_id(user_id, call.data[len("face_mkmodel_"):])
+    if not face:
+        await _safe_answer(call, "Лицо не найдено")
+        return
+    await _safe_answer(call, "Создаю модель...")
+    await _build_model_and_report(call.message.chat.id, user_id, face["name"], quiet_unavailable=False)
+
+@router.callback_query(F.data == "face_model_new")
+async def handle_face_model_new(call: CallbackQuery) -> None:
+    await _safe_answer(call)
+    msg = await bot.send_message(
+        call.message.chat.id,
+        "🧬 <b>Модель лица из нескольких фото</b>\n\n"
+        "Введите имя для нового лица (до 32 символов). Затем пришлите 3–10 фото одного человека "
+        "(можно альбомом, лучше «как файл»), а в конце отправьте слово <b>готово</b>.\n\n"
+        "Чем разнообразнее ракурсы и освещение при чётком лице, тем точнее модель.",
+        parse_mode="HTML")
+    register_next_step(msg.chat.id, model_name_step, call.message.chat.id)
+
+async def model_name_step(message, original_chat_id):
+    user_id = str(message.chat.id)
+    name = (message.text or "").strip().lower()
+    faces = await get_user_faces(user_id)
+    if name == "default":
+        name = f"face_{len(faces) + 1}"
+    if not _valid_face_name(name):
+        msg = await bot.send_message(message.chat.id, "❌ Некорректное имя (до 32 символов, без / \\ : * ? \" < > |). Введите другое имя:")
+        register_next_step(msg.chat.id, model_name_step, original_chat_id)
+        return
+    if any(f["name"] == name for f in faces):
+        msg = await bot.send_message(message.chat.id, f"❌ Лицо '{name}' уже существует. Введите другое имя:")
+        register_next_step(msg.chat.id, model_name_step, original_chat_id)
+        return
+    _model_sessions[user_id] = {"name": name, "photos": []}
+    msg = await bot.send_message(message.chat.id, f"📸 Присылайте фото для «{_h(name)}» (до {MODEL_MAX_PHOTOS}). Когда закончите — напишите <b>готово</b>.", parse_mode="HTML")
+    register_next_step(msg.chat.id, model_collect_step, original_chat_id)
+
+async def model_collect_step(message, original_chat_id):
+    user_id = str(message.chat.id)
+    session = _model_sessions.get(user_id)
+    if session is None:
+        await bot.send_message(message.chat.id, "❌ Сессия создания модели не найдена. Начните заново из меню лиц.")
+        return
+    text = (message.text or "").strip().lower()
+    if text in ("готово", "done", "/done"):
+        _model_sessions.pop(user_id, None)
+        photos = session["photos"]
+        if not photos:
+            await bot.send_message(message.chat.id, "❌ Фото не получено, модель не создана.")
+            return
+        name = session["name"]
+        if not await save_user_face(user_id, io.BytesIO(photos[0]), name):
+            await bot.send_message(message.chat.id, "❌ Ошибка при сохранении лица.")
+            return
+        await bot.send_message(message.chat.id, f"✅ Лицо <b>{_h(name)}</b> сохранено ({len(photos)} фото).", parse_mode="HTML")
+        await _build_model_and_report(message.chat.id, user_id, name, extra_images=photos, quiet_unavailable=False)
+        return
+    # Перерегистрируемся СРАЗУ: фото альбома приходят пачкой и не должны проскакивать в другие обработчики
+    register_next_step(message.chat.id, model_collect_step, original_chat_id)
+    if len(session["photos"]) >= MODEL_MAX_PHOTOS:
+        await bot.send_message(message.chat.id, f"Достигнут лимит {MODEL_MAX_PHOTOS} фото — напишите <b>готово</b>.", parse_mode="HTML")
+        return
+    try:
+        jpeg = await _download_face_jpeg(message)
+    except Exception as e:
+        await bot.send_message(message.chat.id, f"❌ Ошибка загрузки: {_h(_cut(e, 200))}", parse_mode="HTML")
+        return
+    if jpeg is None:
+        await bot.send_message(message.chat.id, "❌ Нужно фото (или картинка файлом). Либо напишите <b>готово</b>.", parse_mode="HTML")
+        return
+    ok, reason = await check_face_photo(jpeg)
+    if not ok:
+        await bot.send_message(message.chat.id, f"❌ Фото пропущено: {_h(reason)}", parse_mode="HTML")
+        return
+    session["photos"].append(jpeg)
+    await bot.send_message(message.chat.id, f"✅ Принято фото {len(session['photos'])}/{MODEL_MAX_PHOTOS}. Ещё или <b>готово</b>.", parse_mode="HTML")
 
 # =========== НАСТРОЙКИ (CALLBACK) ===========
 
@@ -2473,32 +2922,24 @@ async def repeat_confirm(call: CallbackQuery) -> None:
         try:
             # Точный повтор: промпты берутся ровно такими, какие ушли в WebUI в прошлый раз
             # (без повторного перевода через Ollama, без дублирования LoRA и новых «фраз разнообразия»)
+            face_ctx = await get_face_context(user_id) if config.get('face_enabled', False) else None
+            if face_ctx and face_ctx.note:
+                await on_status(f"⚠️ {face_ctx.note}")
             image_file, used_seed, original_prompt, processed_prompt = await generate_image(
                 config['prompt'], dict(config['settings']), user_id, on_progress, on_status, fixed_seed=config['seed'],
-                exact_prompt=config.get('final_prompt'), exact_negative=config.get('final_negative')
+                exact_prompt=config.get('final_prompt'), exact_negative=config.get('final_negative'),
+                face_image=face_ctx.image if face_ctx and face_ctx.use_faceid else None,
+                face_weights=face_ctx.weights if face_ctx else None
             )
             final_image_file = image_file
-            face_replacement_success = False
-            if REACTOR_AVAILABLE and config.get('face_enabled', False):
-                active_face = await get_active_face(user_id)
-                if active_face:
-                    try:
-                        await on_status("🎭 Заменяю лицо...")
-                        final_image_file = await swap_face_with_reactor(
-                            source_image=active_face,
-                            target_image=image_file,
-                            face_model="None",
-                            upscaler="None",
-                            face_restorer="GFPGAN",
-                            restorer_visibility=1.0
-                        )
-                        face_replacement_success = True
-                    except Exception as e:
-                        print(f"Ошибка замены лица: {e}")
-                        final_image_file = image_file
+            swapped = False
+            if face_ctx and face_ctx.use_swap:
+                await on_status("🎭 Заменяю лицо...")
+                final_image_file, swapped = await apply_face_swap(face_ctx, image_file)
+            face_replacement_success = bool(face_ctx and (face_ctx.use_faceid or swapped))
             try:
                 await bot.delete_message(chat_id, task.status_message_id)
-            except:
+            except Exception:
                 pass
             cfg = config['settings']
             caption = (
@@ -2509,8 +2950,7 @@ async def repeat_confirm(call: CallbackQuery) -> None:
                 f"🎚️ <b>CFG:</b> {cfg.get('cfg_scale')}\n"
                 f"🎲 <b>Seed:</b> <code>{used_seed}</code> (повтор)\n"
             )
-            if face_replacement_success:
-                caption += "🎭 <b>Лицо заменено</b>\n"
+            caption += _face_caption_line(face_ctx, swapped)
             sent_msg = await send_image_smart(chat_id, final_image_file, caption=caption, parse_mode="HTML")
             last_images[user_id] = final_image_file
             last_message_ids[user_id] = sent_msg.message_id
@@ -2638,28 +3078,14 @@ async def handle_extended_neg_choice(call: CallbackQuery) -> None:
 # =========== РЕДАКТИРОВАНИЕ (IMG2IMG) ===========
 
 async def apply_face_replacement_if_enabled(user_id, image):
-    if not REACTOR_AVAILABLE:
+    # Правка готового изображения: FaceID тут не при чём, лицо ставится ReActor-заменой (по модели, если она есть)
+    ctx = await get_face_context(user_id, allow_faceid=False)
+    if not ctx or not ctx.use_swap:
         return image
-    if not await get_face_enabled(user_id):
-        return image
-    active_face = await get_active_face(user_id)
-    if not active_face:
-        return image
-    try:
-        print(f"🎭 Применяю замену лица для пользователя {user_id}")
-        result = await swap_face_with_reactor(
-            source_image=active_face,
-            target_image=image,
-            face_model="None",
-            upscaler="None",
-            face_restorer="GFPGAN",
-            restorer_visibility=1.0
-        )
-        print("✅ Замена лица выполнена успешно")
-        return result
-    except Exception as e:
-        print(f"❌ Ошибка замены лица: {e}")
-        return image
+    print(f"🎭 Применяю замену лица для пользователя {user_id}")
+    result, ok = await apply_face_swap(ctx, image)
+    print("✅ Замена лица выполнена успешно" if ok else "❌ Замена лица не удалась")
+    return result
 
 @router.callback_query(F.data == "action_img2img")
 async def show_edit_options(call: CallbackQuery) -> None:
@@ -2784,7 +3210,7 @@ async def process_edit_prompt(message, edit_type, user_id, original_msg_id):
             final_image = await apply_face_replacement_if_enabled(user_id, new_image)
             try:
                 await bot.delete_message(message.chat.id, task.status_message_id)
-            except:
+            except Exception:
                 pass
             sent_msg = await send_image_smart(message.chat.id, final_image,
                                         caption=f"✅ Редактирование <b>{_h(edit_type)}</b>\nПромпт: <code>{_h(_cut(prompt, 800))}</code>", parse_mode="HTML")
@@ -2855,16 +3281,20 @@ async def handle_manage_lora(call: CallbackQuery) -> None:
     available = await get_available_loras()
     lora_enabled = await get_user_lora_enabled(user_id)
     markup = types.InlineKeyboardMarkup(row_width=2)
+    lora_weights = await get_user_lora_weights(user_id)
     for lora_name, info in available.items():
         status = "✅" if lora_enabled.get(lora_name, True) else "❌"
-        btn_text = _cut(f"{status} {info['name']}", 60)
+        btn_text = _cut(f"{status} {info['name']}", 40)
         # callback_data у Telegram ограничена 64 байтами — длинные/русские имена LoRA её превышали и ломали меню
-        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"lora_toggle_{_lora_id(lora_name)}"))
+        markup.add(
+            types.InlineKeyboardButton(btn_text, callback_data=f"lora_toggle_{_lora_id(lora_name)}"),
+            types.InlineKeyboardButton(f"⚖️ {lora_weights.get(lora_name, 1.0):g}", callback_data=f"lora_weight_{_lora_id(lora_name)}"),
+        )
     # Кнопка обновления списка
     markup.add(types.InlineKeyboardButton("🔄 Обновить список LoRA", callback_data="refresh_lora_list"))
     markup.add(types.InlineKeyboardButton("◀️ Назад в настройки", callback_data="back_to_settings"))
 
-    text = f"🎛️ **Управление LoRA**\n\nВыберите LoRA для включения/отключения.\nОни будут автоматически добавляться в промпт при генерации.\n\nДоступно: {len(available)} LoRA"
+    text = f"🎛️ **Управление LoRA**\n\nНажмите на название — включить/отключить, на ⚖️ — сменить вес (0.4 → 0.6 → 0.8 → 1.0 → 1.2).\nВключённые LoRA автоматически добавляются в промпт при генерации.\n\nДоступно: {len(available)} LoRA"
 
     try:
         await bot.edit_message_text(
@@ -2910,6 +3340,19 @@ async def handle_lora_toggle(call: CallbackQuery) -> None:
     # Перерисовываем меню (редактируем то же сообщение)
     await handle_manage_lora(call)
 
+@router.callback_query(F.data.startswith("lora_weight_"))
+async def handle_lora_weight(call: CallbackQuery) -> None:
+    user_id = str(call.message.chat.id)
+    lora_id = call.data[len("lora_weight_"):]
+    available = await get_available_loras()
+    lora_name = next((name for name in available if _lora_id(name) == lora_id), None)
+    if lora_name is None:
+        await _safe_answer(call, "❌ LoRA не найдена — обновите список", show_alert=True)
+        return
+    weight = await cycle_user_lora_weight(user_id, lora_name)
+    await _safe_answer(call, f"Вес {available[lora_name]['name']}: {weight:g}"[:200])
+    await handle_manage_lora(call)
+
 @router.callback_query(F.data == "refresh_lora_list")
 async def handle_refresh_lora(call: CallbackQuery) -> None:
     new_loras = await get_available_loras(force_refresh=True)
@@ -2927,6 +3370,112 @@ async def handle_back_to_settings(call: CallbackQuery) -> None:
 # =========== ЗАПУСК БОТА ===========
 
 # =========== ЗАПУСК БОТА ===========
+
+START_TIME = time.time()
+_console_task: Optional["asyncio.Task[None]"] = None
+_watchdog_task: Optional["asyncio.Task[None]"] = None
+
+
+async def _send_broadcast_message(chat_id: int, text: str) -> str:
+    """Рассылка: обычный текст без разметки. "ok" | "blocked" (бот заблокирован/чат удалён) | "error"."""
+    from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+    for _ in range(2):
+        try:
+            await bot.send_message(chat_id, text)
+            return "ok"
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except TelegramForbiddenError:
+            return "blocked"
+        except TelegramBadRequest as e:
+            return "blocked" if any(s in str(e).lower() for s in ("chat not found", "deactivated")) else "error"
+        except Exception:
+            return "error"
+    return "error"
+
+
+def _build_console_context(color: bool = False, reply_chat_id: Optional[int] = None, actor: Optional[str] = None):
+    """Контекст команд администратора — общий для терминала и админ-панели в Telegram."""
+    import admin_console
+    return admin_console.ConsoleContext(
+        get_queue=lambda: task_queue, reload_caches=_reload_caches, stop=_stop_bot,
+        started_at=START_TIME, mode=config.BOT_MODE, color=color, actor=actor,
+        send_user=_send_broadcast_message,
+        reply=(lambda text: bot.send_message(reply_chat_id, text)) if reply_chat_id else None,
+        notify=lambda chat_id, text: bot_api.send_message(chat_id, text, parse_mode="HTML"),
+        refund_stars=lambda user_id, charge_id: bot_api.refund_star_payment(user_id, charge_id))
+
+
+async def _notify_admins(text: str, owner_only: bool = False) -> None:
+    """Сообщение администраторам (владелец + ADMIN_USER_IDS + выданные из консоли); деньги — только владельцу."""
+    if owner_only:
+        owner = os.environ.get("ADMIN_USER_ID", "").strip()
+        ids = [owner] if owner else []
+    else:
+        ids = await subscriptions.all_admin_ids()
+    for admin_id in ids:
+        if admin_id.lstrip("-").isdigit():
+            try:
+                await bot.send_message(int(admin_id), text, parse_mode="HTML")
+            except Exception as e:
+                print(f"⚠️ Не удалось уведомить администратора {admin_id}: {e}")
+
+
+async def _watchdog() -> None:
+    """Раз в WATCHDOG_INTERVAL секунд проверяет WebUI; оповещает о падении (после 2 неудач подряд) и о восстановлении."""
+    failures, alerted = 0, False
+    while True:
+        await asyncio.sleep(config.WATCHDOG_INTERVAL)
+        try:
+            up = await check_api_available()
+        except Exception:
+            up = False
+        if up:
+            if alerted:
+                await _notify_admins("✅ <b>WebUI снова доступен</b>")
+            failures, alerted = 0, False
+        else:
+            failures += 1
+            if failures >= 2 and not alerted:
+                alerted = True
+                await _notify_admins(f"🔴 <b>WebUI недоступен</b> ({_h(config.SD_BASE_URL)}). Генерации не пойдут, пока он не поднимется.")
+
+
+async def _reload_caches() -> None:
+    """Принудительно обновляет все кэши справочников WebUI (команда `reload` админ-консоли)."""
+    global REACTOR_AVAILABLE
+    from Aapi import check_adetailer_available, get_faceid_setup
+    from face_manager import reactor_ok
+    await asyncio.gather(
+        get_available_loras(force_refresh=True), get_available_embeddings(force_refresh=True),
+        get_available_models(force_refresh=True), get_controlnet_sources(force_refresh=True),
+        get_faceid_setup(force=True), check_adetailer_available(force_refresh=True),
+        return_exceptions=True,
+    )
+    REACTOR_AVAILABLE = await reactor_ok(force=True)
+
+
+async def _stop_bot() -> None:
+    """Корректная остановка из админ-консоли (long polling; в режиме webhook — Ctrl+C)."""
+    if config.BOT_MODE == "webhook":
+        print("В режиме webhook остановите бота сочетанием Ctrl+C.")
+        return
+    try:
+        await dp.stop_polling()
+    except Exception as e:
+        print(f"❌ Не удалось остановить polling: {e}")
+
+
+async def _startup_health_check() -> None:
+    """Полная проверка систем при запуске: отчёт в консоль, сводка админу в Telegram, опционально — остановка."""
+    import healthcheck
+    results = await healthcheck.run_health_check()
+    print(healthcheck.format_report(results, color=healthcheck.use_color()))
+    await _notify_admins(healthcheck.telegram_summary(results))
+    if config.STARTUP_CHECK_STRICT and healthcheck.has_failures(results):
+        await close_session()
+        raise SystemExit("❌ STARTUP_CHECK_STRICT=1: есть критичные ошибки, запуск остановлен.")
+
 
 async def on_startup(bot: Bot):
     """Хук aiogram: прогрев кэшей и запуск воркеров очереди (цикл событий уже работает)."""
@@ -2970,6 +3519,14 @@ async def on_startup(bot: Bot):
     print(f"🧩 Моделей в WebUI: {len(models or [])}; по умолчанию: {default_model or 'не определена'}")
     print(f"📊 Всего поз в базе: {len(sources or [])}")
 
+    if config.STARTUP_CHECK:
+        try:
+            await _startup_health_check()
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"⚠️ Проверка систем не выполнена: {e}")
+
     # Список команд в меню Telegram
     try:
         await bot_api.set_my_commands([
@@ -2979,6 +3536,9 @@ async def on_startup(bot: Bot):
             types.BotCommand("setsampler", "Выбрать сэмплер"),
             types.BotCommand("model", "Выбрать модель"),
             types.BotCommand("cancel", "Отменить мои задачи"),
+            types.BotCommand("plan", "Мой тариф, лимиты и оплата"),
+            types.BotCommand("invite", "Пригласить друга (бонусы)"),
+            types.BotCommand("paysupport", "Поддержка по платежам"),
             types.BotCommand("prompts", "Лог промптов (админ)"),
         ])
     except Exception as e:
@@ -2990,11 +3550,31 @@ async def on_startup(bot: Bot):
     print(f"📝 Лог промптов: {config.PROMPT_LOG_FILE} ({'вкл' if config.PROMPT_LOG_ENABLED else 'выкл'})")
     print(f"⚙️ Режим: {config.BOT_MODE}; воркеров очереди: {config.QUEUE_WORKERS}; запросов к WebUI одновременно: {config.SD_MAX_PARALLEL}")
 
+    # Админ-консоль — только в интерактивном терминале (не в службе/Docker без TTY)
+    global _console_task
+    if config.ADMIN_CONSOLE and sys.stdin is not None and sys.stdin.isatty():
+        import admin_console
+        import healthcheck
+        _console_task = asyncio.create_task(
+            admin_console.run(_build_console_context(color=healthcheck.use_color())), name="admin-console")
+
+    # Сторож WebUI: оповещает администраторов в Telegram, когда WebUI падает и когда поднимается
+    global _watchdog_task
+    if config.WATCHDOG_INTERVAL > 0:
+        _watchdog_task = asyncio.create_task(_watchdog(), name="webui-watchdog")
+
 
 async def on_shutdown(bot: Bot):
     """Хук aiogram: корректная остановка — прерываем задачи (и генерацию в WebUI), закрываем HTTP-сеанс."""
     global task_queue
     print("🛑 Останавливаюсь...")
+    global _console_task, _watchdog_task
+    for _task in (_console_task, _watchdog_task):
+        if _task is not None:
+            _task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await _task
+    _console_task = _watchdog_task = None
     if task_queue is not None:
         await task_queue.shutdown()
         task_queue = None
