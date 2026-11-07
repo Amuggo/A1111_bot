@@ -30,7 +30,7 @@ except Exception as _seg_error:  # ImportError, а также AttributeError у 
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from Aapi import ( 
+from Aapi import (
     preprocess_prompt,
     generate_image, generate_txt2img_advanced, check_api_available,
     upscale_image, generate_img2img, swap_face_with_reactor,
@@ -49,8 +49,8 @@ from settings import (
     get_prompt_processing_enabled, set_prompt_processing_enabled,
     set_diversity_mode, set_user_negative_prompt,
     get_user_lora_enabled, set_user_lora_enabled, get_available_loras,
-    set_available_loras, fetch_loras_from_api,
-    get_user_lora_weights, cycle_user_lora_weight,
+    set_available_loras, get_user_lora_enabled, set_user_lora_enabled,
+    fetch_loras_from_api,
     get_available_models, refresh_checkpoints_on_server, get_user_model,
     set_user_model, get_default_model, get_default_model_name,
     update_user_settings, get_available_embeddings, refresh_embeddings_on_server,
@@ -62,15 +62,12 @@ from face_manager import (
     save_user_face, get_user_faces, get_active_face, set_active_face,
     delete_face, get_face_preview, get_face_stats,
     check_reactor_available as check_reactor,
-    get_face_enabled, set_face_enabled, get_active_face_name,
-    FACE_MODES, FACE_MODE_LABELS, get_face_mode, set_face_mode, build_face_model,
-    get_face_context, apply_face_swap, face_features_available,
-    get_face_weights, cycle_face_weight, rename_face
+    get_face_enabled, set_face_enabled, get_active_face_name
 )
-from face_check import check_face_photo
 
 from task_queue import QueueFull, Task, TaskQueue  # noqa: E402
 from http_client import close_session  # noqa: E402
+from face_manager import rename_face  # noqa: E402
 import app_config as config  # noqa: E402  (загружает .env и переменные окружения)
 import prompt_logger  # noqa: E402  (логирование промптов пользователей)
 
@@ -287,18 +284,6 @@ def _h(value):
 def _cut(text, limit):
     text = str(text)
     return text if len(text) <= limit else text[:limit - 1] + "…"
-
-def _face_caption_line(ctx, swapped) -> str:
-    """Строка подписи: как именно было применено лицо (FaceID в генерации и/или ReActor-замена)."""
-    if not ctx:
-        return ""
-    parts = []
-    if ctx.use_faceid:
-        fw, lw = ctx.weights or (None, None)
-        parts.append("FaceID (лицо задано при генерации" + (f", сила {fw}, LoRA {lw}" if fw is not None else "") + ")")
-    if swapped:
-        parts.append("ReActor-замена по модели" if ctx.model_file else "ReActor-замена")
-    return f"🎭 <b>Лицо:</b> {_h(', '.join(parts))}\n" if parts else ""
 
 def _text(message):
     """Текст сообщения или пустая строка (фото, стикер и т.п. раньше роняли обработчики на None.strip())."""
@@ -664,14 +649,14 @@ async def handle_controlnet_category(call: CallbackQuery) -> None:
     if user_id in preview_messages:
         try:
             await bot.delete_message(call.message.chat.id, preview_messages[user_id])
-        except Exception:
+        except:
             pass
         del preview_messages[user_id]
 
     # Удаляем сообщение с категориями (текущее)
     try:
         await bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
+    except:
         pass
 
     await show_controlnet_page(call.message, user_id, 0)
@@ -744,11 +729,11 @@ async def handle_controlnet_back_categories(call: CallbackQuery) -> None:
     if list_msg_id:
         try:
             await bot.delete_message(call.message.chat.id, list_msg_id)
-        except Exception:
+        except:
             pass
     try:
         await bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
+    except:
         pass
     # Сбрасываем фильтр
     if user_id in pagination_data:
@@ -767,7 +752,7 @@ async def handle_controlnet_page(call: CallbackQuery) -> None:
         return
     try:
         page = int(call.data.split("_")[2])
-    except Exception:
+    except:
         await bot.answer_callback_query(call.id, "Ошибка")
         return
     if user_id not in pagination_data:
@@ -779,13 +764,13 @@ async def handle_controlnet_page(call: CallbackQuery) -> None:
     if old_list_id:
         try:
             await bot.delete_message(call.message.chat.id, old_list_id)
-        except Exception:
+        except:
             pass
         data['list_message_id'] = None
     # Удаляем текущее сообщение (это callback от кнопки навигации, оно тоже может быть удалено)
     try:
         await bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
+    except:
         pass
     await show_controlnet_page(call.message, user_id, page)
     await bot.answer_callback_query(call.id)
@@ -826,12 +811,12 @@ async def handle_controlnet_refresh(call: CallbackQuery) -> None:
     # Удаляем старое сообщение списка (текущее)
     try:
         await bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
+    except:
         pass
     if user_id in preview_messages:
         try:
             await bot.delete_message(call.message.chat.id, preview_messages[user_id])
-        except Exception:
+        except:
             pass
         del preview_messages[user_id]
 
@@ -843,7 +828,7 @@ async def handle_controlnet_preview(call: CallbackQuery) -> None:
     user_id = str(call.message.chat.id)
     try:
         idx = int(call.data.split("_")[2])
-    except Exception:
+    except:
         await bot.answer_callback_query(call.id, "Ошибка")
         return
     data = pagination_data.get(user_id)
@@ -867,20 +852,20 @@ async def handle_controlnet_preview(call: CallbackQuery) -> None:
     if list_msg_id:
         try:
             await bot.delete_message(call.message.chat.id, list_msg_id)
-        except Exception:
+        except:
             pass
         data['list_message_id'] = None
     # Удаляем текущее сообщение (кнопка предпросмотра) – оно уже не нужно
     try:
         await bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
+    except:
         pass
 
     # Удаляем старое превью
     if user_id in preview_messages:
         try:
             await bot.delete_message(call.message.chat.id, preview_messages[user_id])
-        except Exception:
+        except:
             pass
         del preview_messages[user_id]
     
@@ -907,7 +892,7 @@ async def handle_controlnet_back_to_list(call: CallbackQuery) -> None:
     # Удаляем сообщение с превью
     try:
         await bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
+    except:
         pass
     if user_id in preview_messages:
         del preview_messages[user_id]
@@ -925,7 +910,7 @@ async def handle_controlnet_use(call: CallbackQuery) -> None:
     user_id = str(call.message.chat.id)
     try:
         idx = int(call.data.split("_")[2])
-    except Exception:
+    except:
         await bot.answer_callback_query(call.id, "Ошибка")
         return
     data = pagination_data.get(user_id)
@@ -951,7 +936,7 @@ async def handle_controlnet_use(call: CallbackQuery) -> None:
     # Удаляем сообщение с превью
     try:
         await bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
+    except:
         pass
     if user_id in preview_messages:
         del preview_messages[user_id]
@@ -981,7 +966,7 @@ async def handle_controlnet_random(call: CallbackQuery) -> None:
     # Удаляем текущее сообщение с превью
     try:
         await bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
+    except:
         pass
     if user_id in preview_messages:
         del preview_messages[user_id]
@@ -1081,9 +1066,6 @@ async def process_controlnet_prompt(message, user_id, source=None):
                 processed_prompt = f"{processed_prompt}, {lora_tags}"
                 await on_status(f"🎛️ Добавлены LoRA: {lora_tags}")
 
-            face_ctx = await get_face_context(user_id, need_controlnet_slot=True)
-            if face_ctx and face_ctx.note:
-                await on_status(f"⚠️ {face_ctx.note}")
             generated_image = await generate_txt2img_controlnet(
                 processed_prompt,  # используем обработанный промпт
                 control_image=control_img,
@@ -1092,19 +1074,16 @@ async def process_controlnet_prompt(message, user_id, source=None):
                 settings=settings,
                 progress_callback=on_progress,
                 status_callback=on_status,
-                user_id=user_id,
-                face_image=face_ctx.image if face_ctx and face_ctx.use_faceid else None,
-                face_weights=face_ctx.weights if face_ctx else None
+                user_id=user_id
             )
-            final_image = generated_image
-            swapped = False
-            if face_ctx and face_ctx.use_swap:
-                await on_status("🎭 Заменяю лицо...")
-                final_image, swapped = await apply_face_swap(face_ctx, generated_image)
-            face_replaced = bool(face_ctx and (face_ctx.use_faceid or swapped))
+            await on_status("🎭 Заменяю лицо...")
+            final_image = await apply_face_replacement_if_enabled(user_id, generated_image)
+            face_replaced = False
+            if REACTOR_AVAILABLE and await get_face_enabled(user_id) and await get_active_face(user_id):
+                face_replaced = True
             try:
                 await bot.delete_message(message.chat.id, task.status_message_id)
-            except Exception:
+            except:
                 pass
         
             # Формируем капшн с полной информацией
@@ -1118,7 +1097,8 @@ async def process_controlnet_prompt(message, user_id, source=None):
                 f"🎚️ <b>CFG:</b> {settings.get('cfg_scale', 7.0)}\n"
                 f"🎲 <b>Seed:</b> <code>{getattr(generated_image, 'seed', 'N/A')}</code>\n"
             )
-            caption += _face_caption_line(face_ctx, swapped)
+            if face_replaced:
+                caption += "🎭 <b>Лицо заменено</b>\n"
             sent_msg = await send_image_smart(message.chat.id, final_image, caption=caption, parse_mode="HTML")
             last_images[user_id] = final_image
             last_message_ids[user_id] = sent_msg.message_id
@@ -1347,51 +1327,33 @@ async def ask_for_upscale(message: Message) -> None:
 
 @router.message(F.text == "🎭 Управление лицом")
 async def face_management(message: Message) -> None:
-    if not await face_features_available():
-        await bot.reply_to(message, "❌ Функция лиц недоступна: в WebUI не найден ни ReActor, ни FaceID (ControlNet). Подробности — в README, раздел «Лица».")
+    if not REACTOR_AVAILABLE:
+        await bot.reply_to(message, "❌ Функция замены лиц временно недоступна. Попробуйте позже.")
         return
     user_id = str(message.chat.id)
     stats = await get_face_stats(user_id)
     face_enabled = await get_face_enabled(user_id)
-    mode = await get_face_mode(user_id)
-    faces = await get_user_faces(user_id)
-    models_count = sum(1 for f in faces if f.get("model"))
-    fw, lw = await get_face_weights(user_id)
-    try:
-        from Aapi import get_faceid_setup
-        setup = await get_faceid_setup()
-    except Exception as e:
-        setup = {"ok": False, "reason": str(e)}
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    status_text = "✅ Включено" if face_enabled else "❌ Выключено"
-    buttons = [
-        types.InlineKeyboardButton(f"🎭 Лицо в генерации: {status_text}", callback_data="face_toggle_main"),
-        types.InlineKeyboardButton(f"🧠 Режим: {FACE_MODE_LABELS[mode]}", callback_data="face_mode_cycle"),
-        types.InlineKeyboardButton(f"🎚️ Сила лица (FaceID): {fw:g}", callback_data="face_weight_faceid"),
-        types.InlineKeyboardButton(f"🧴 Вес LoRA лица: {'выкл.' if lw <= 0 else format(lw, 'g')}", callback_data="face_weight_lora"),
-        types.InlineKeyboardButton("📸 Добавить новое лицо", callback_data="face_add"),
-        types.InlineKeyboardButton("🧬 Модель лица из нескольких фото", callback_data="face_model_new"),
-    ]
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    buttons = []
+    status_text = "✅ Включена" if face_enabled else "❌ Выключена"
+    buttons.append(types.InlineKeyboardButton(f"🎭 Замена лиц: {status_text}", callback_data="face_toggle_main"))
+    buttons.append(types.InlineKeyboardButton("📸 Добавить новое лицо", callback_data="face_add"))
     if stats["total_faces"] > 0:
         buttons.append(types.InlineKeyboardButton("📋 Список лиц", callback_data="face_list"))
     markup.add(*buttons)
-    active_face = stats.get("active_face") or "не выбрано"
-    faceid_line = "✅ готов" if setup.get("ok") else f"⚠️ не готов: {_h(setup.get('reason') or '—')}"
+    active_face = stats.get("active_face", "не выбрано")
     info_text = (
-        "🎭 <b>Управление лицами</b>\n\n"
-        f"📸 <b>Всего лиц:</b> {stats['total_faces']} (с моделью ReActor: {models_count})\n"
-        f"⭐ <b>Активное лицо:</b> {_h(active_face)}\n"
-        f"🧠 <b>FaceID:</b> {faceid_line}\n"
-        f"🎚️ <b>Сила лица:</b> {fw:g} · <b>LoRA:</b> {'выкл.' if lw <= 0 else format(lw, 'g')}\n\n"
-        "💡 <b>Режимы:</b>\n"
-        "🔁 <b>Замена после генерации</b> — ReActor подменяет лицо на готовой картинке (по модели лица, если она создана).\n"
-        "🧠 <b>FaceID в генерации</b> — лицо задаётся прямо при генерации (IP-Adapter), без замены.\n"
-        "🧠+🔁 <b>Оба</b> — FaceID, а сверху ReActor для максимального сходства.\n\n"
-        "🎚️ Сила лица — насколько жёстко FaceID держит сходство (выше — похожее, но «деревянное»; ниже — живее). "
-        "LoRA лица усиливает сходство, обычно 0.5–0.7.\n\n"
-        "✨ Для лучшего результата используйте чёткие фото анфас; модель из 3–10 фото точнее, чем из одного."
+        "🎭 **Управление лицами**\n\n"
+        f"📸 **Всего лиц:** {stats['total_faces']}\n"
+        f"⭐ **Активное лицо:** {active_face}\n\n"
+        "💡 **Как работает:**\n"
+        "1. Добавьте одно или несколько лиц\n"
+        "2. Выберите активное лицо\n"
+        "3. Включите замену лиц\n"
+        "4. Генерируйте изображения - лица будут заменены!\n\n"
+        "✨ **Совет:** Для лучшего качества используйте фото с хорошим освещением"
     )
-    await bot.send_message(message.chat.id, info_text, parse_mode="HTML", reply_markup=markup)
+    await bot.send_message(message.chat.id, info_text, parse_mode="Markdown", reply_markup=markup)
 
 # =========== СТАТИСТИКА ЛОГА ПРОМПТОВ ===========
 # (Обработчик должен быть зарегистрирован ДО универсального текстового обработчика ниже —
@@ -1840,23 +1802,31 @@ async def handle_quick_generation(message: Message) -> None:
         start_time = time.time()
         on_progress, on_status = make_callbacks(task)
         try:
-            face_ctx = await get_face_context(user_id)
-            if face_ctx and face_ctx.note:
-                await on_status(f"⚠️ {face_ctx.note}")
             image_file, used_seed, original_prompt, processed_prompt = await generate_image(
-                prompt, settings, user_id, on_progress, on_status, fixed_seed=None,
-                face_image=face_ctx.image if face_ctx and face_ctx.use_faceid else None,
-                face_weights=face_ctx.weights if face_ctx else None
+                prompt, settings, user_id, on_progress, on_status, fixed_seed=None
             )
             final_image_file = image_file
-            swapped = False
-            if face_ctx and face_ctx.use_swap:
-                await on_status("🎭 Заменяю лицо...")
-                final_image_file, swapped = await apply_face_swap(face_ctx, image_file)
-            face_replacement_success = bool(face_ctx and (face_ctx.use_faceid or swapped))
+            face_replacement_success = False
+            if REACTOR_AVAILABLE and await get_face_enabled(user_id):
+                active_face = await get_active_face(user_id)
+                if active_face:
+                    try:
+                        await on_status("🎭 Заменяю лицо...")
+                        final_image_file = await swap_face_with_reactor(
+                            source_image=active_face,
+                            target_image=image_file,
+                            face_model="None",
+                            upscaler="None",
+                            face_restorer="GFPGAN",
+                            restorer_visibility=1.0
+                        )
+                        face_replacement_success = True
+                    except Exception as e:
+                        print(f"Ошибка замены лица: {e}")
+                        final_image_file = image_file
             try:
                 await bot.delete_message(message.chat.id, task.status_message_id)
-            except Exception:
+            except:
                 pass
             caption = (
                 f"✨ <b>Исходный промпт:</b>\n<code>{_h(_cut(original_prompt, 700))}</code>\n\n"
@@ -1869,7 +1839,8 @@ async def handle_quick_generation(message: Message) -> None:
                 + (f"🔬 <b>Hires:</b> {hires_plan(settings)['scale']}x → {hires_plan(settings)['width']}×{hires_plan(settings)['height']}\n"
                    if hires_plan(settings) else "")
             )
-            caption += _face_caption_line(face_ctx, swapped)
+            if face_replacement_success:
+                caption += "🎭 <b>Лицо заменено</b>\n"
             # Фото либо файл (если не проходит по весу/разрешению), подпись длиннее 1024 — отдельным сообщением
             sent_msg = await send_image_smart(message.chat.id, final_image_file, caption=caption, parse_mode="HTML",
                                         reply_to_message_id=message.message_id)
@@ -1914,25 +1885,7 @@ async def handle_face_toggle_main(call: CallbackQuery) -> None:
     new_state = not current
     await set_face_enabled(user_id, new_state)
     status = "включена ✅" if new_state else "выключена ❌"
-    await bot.answer_callback_query(call.id, f"Лицо в генерации {status}")
-    await face_management(call.message)
-
-@router.callback_query(F.data.in_({"face_weight_faceid", "face_weight_lora"}))
-async def handle_face_weight(call: CallbackQuery) -> None:
-    user_id = str(call.message.chat.id)
-    kind = "faceid" if call.data == "face_weight_faceid" else "lora"
-    value = await cycle_face_weight(user_id, kind)
-    label = "Сила лица" if kind == "faceid" else "Вес LoRA лица"
-    await _safe_answer(call, f"{label}: {'выкл.' if kind == 'lora' and value <= 0 else format(value, 'g')}")
-    await face_management(call.message)
-
-@router.callback_query(F.data == "face_mode_cycle")
-async def handle_face_mode_cycle(call: CallbackQuery) -> None:
-    user_id = str(call.message.chat.id)
-    current = await get_face_mode(user_id)
-    new_mode = FACE_MODES[(FACE_MODES.index(current) + 1) % len(FACE_MODES)]
-    await set_face_mode(user_id, new_mode)
-    await _safe_answer(call, f"Режим: {FACE_MODE_LABELS[new_mode]}")
+    await bot.answer_callback_query(call.id, f"Замена лиц {status}")
     await face_management(call.message)
 
 @router.callback_query(F.data == "face_add")
@@ -1966,11 +1919,6 @@ async def save_new_face(message, original_chat_id):
         except Exception:
             await bot.send_message(message.chat.id, "❌ Не удалось прочитать изображение. Отправьте фото в формате JPG/PNG.")
             return
-        ok, reason = await check_face_photo(jpeg_bytes)
-        if not ok:
-            await bot.send_message(message.chat.id, f"❌ {reason}\nОтправьте другое фото.")
-            register_next_step(message.chat.id, save_new_face, original_chat_id)
-            return
         temp_face = io.BytesIO(jpeg_bytes)
         temp_data.setdefault(user_id, {})['temp_face'] = temp_face
         msg = await bot.send_message(message.chat.id, "✏️ **Введите имя для этого лица**\n\nНапример: 'я', 'друг', 'коллега' и т.д.\n\nИли отправьте 'default' для стандартного имени.", parse_mode="Markdown")
@@ -2001,7 +1949,6 @@ async def set_face_name(message, original_chat_id):
             preview = await get_face_preview(user_id, face_name)
             if preview:
                 await bot.send_photo(message.chat.id, preview, caption=f"📸 {face_name}")
-            await _build_model_and_report(message.chat.id, user_id, face_name)
         else:
             await bot.send_message(message.chat.id, "❌ Ошибка при сохранении лица.")
         temp_data.get(user_id, {}).pop('temp_face', None)
@@ -2022,6 +1969,12 @@ def _face_id(face_name):
 async def _find_face_by_id(user_id, face_id):
     faces = await get_user_faces(user_id)
     return next((f for f in faces if _face_id(f["name"]) == face_id), None)
+
+async def _safe_answer(call, text=None, show_alert=False):
+    try:
+        await bot.answer_callback_query(call.id, text, show_alert=show_alert)
+    except Exception:
+        pass  # на один callback можно ответить только один раз
 
 async def _replace_message(call, text, markup=None):
     """Заменяет сообщение с кнопками на текстовое (работает и для фото-сообщений)."""
@@ -2056,7 +2009,7 @@ async def handle_face_list(call: CallbackQuery) -> None:
         await _safe_answer(call)
         return
     for face in faces:
-        status = ("⭐ " if face["is_active"] else "📸 ") + ("🧬 " if face.get("model") else "")
+        status = "⭐ " if face["is_active"] else "📸 "
         markup.add(types.InlineKeyboardButton(f"{status}{face['name']}", callback_data=f"face_select_{_face_id(face['name'])}"))
     markup.add(types.InlineKeyboardButton("◀️ Назад", callback_data="face_back"))
     await _replace_message(call, "📋 <b>Список ваших лиц</b>\n\nВыберите лицо для управления:", markup)
@@ -2074,9 +2027,6 @@ async def handle_face_select(call: CallbackQuery) -> None:
     markup = types.InlineKeyboardMarkup(row_width=2)
     if not face["is_active"]:
         markup.add(types.InlineKeyboardButton("⭐ Сделать активным", callback_data=f"face_activate_{fid}"))
-    markup.add(types.InlineKeyboardButton(
-        "🧬 Пересоздать модель ReActor" if face.get("model") else "🧬 Создать модель ReActor",
-        callback_data=f"face_mkmodel_{fid}"))
     markup.add(
         types.InlineKeyboardButton("✏️ Переименовать", callback_data=f"face_rename_{fid}"),
         types.InlineKeyboardButton("🗑️ Удалить", callback_data=f"face_delete_{fid}"),
@@ -2084,8 +2034,7 @@ async def handle_face_select(call: CallbackQuery) -> None:
     )
     preview = await get_face_preview(user_id, face_name)
     status_text = "⭐ Активно" if face["is_active"] else "📸 Не активно"
-    model_text = "🧬 Модель ReActor создана" if face.get("model") else "▫️ Модели ReActor нет"
-    caption = f"<b>{html.escape(face_name)}</b>\n{status_text}\n{model_text}"
+    caption = f"<b>{html.escape(face_name)}</b>\n{status_text}"
     if preview:
         await bot.send_photo(call.message.chat.id, preview, caption=caption, parse_mode="HTML", reply_markup=markup)
         try:
@@ -2171,136 +2120,6 @@ async def handle_face_confirm_delete(call: CallbackQuery) -> None:
 @router.callback_query(F.data == "face_back")
 async def handle_face_back(call: CallbackQuery) -> None:
     await face_management(call.message)
-
-# --- Модели лиц ReActor ----------------------------------------------------
-# Модель лица — это .safetensors с усреднённым эмбеддингом лица (models/reactor/faces на стороне WebUI).
-# ReActor применяет её быстрее и стабильнее, чем разбор исходного фото при каждой замене.
-
-MODEL_MAX_PHOTOS = 10
-_model_sessions: dict = {}   # user_id -> {"name": str, "photos": [jpeg bytes]}
-
-async def _build_model_and_report(chat_id, user_id, face_name, extra_images=None, quiet_unavailable=True):
-    """Строит модель ReActor и сообщает результат. Ошибки не роняют сценарий: лицо остаётся доступным как фото."""
-    if not await check_reactor():
-        if not quiet_unavailable:
-            await bot.send_message(chat_id, "⚠️ ReActor недоступен — модель лица создать нельзя (лицо сохранено как фото).")
-        return False
-    status = await bot.send_message(chat_id, "🧬 Создаю модель лица ReActor...")
-    try:
-        model_file = await build_face_model(user_id, face_name, extra_images)
-        text = f"🧬 <b>Модель лица создана:</b> <code>{_h(model_file)}</code>\nТеперь замена будет идти по модели."
-        ok = True
-    except Exception as e:
-        text = f"⚠️ Не удалось создать модель ReActor: {_h(_cut(e, 500))}\nЛицо сохранено, замена пойдёт по фото."
-        ok = False
-    try:
-        await bot.edit_message_text(text, chat_id, status.message_id, parse_mode="HTML")
-    except Exception:
-        await bot.send_message(chat_id, text, parse_mode="HTML")
-    return ok
-
-async def _download_face_jpeg(message) -> Optional[bytes]:
-    """Скачивает фото (или картинку-файл) из сообщения и приводит к JPEG. None — если это не изображение."""
-    document = getattr(message, "document", None)
-    if message.photo:
-        file_id = message.photo[-1].file_id
-    elif document and (getattr(document, "mime_type", None) or "").startswith("image/"):
-        file_id = document.file_id
-    else:
-        return None
-    file_info = await bot.get_file(file_id)
-    raw = await bot.download_file(file_info.file_path)
-
-    def to_jpeg(data: bytes) -> bytes:
-        with Image.open(io.BytesIO(data)) as img:
-            out = io.BytesIO()
-            img.convert("RGB").save(out, format="JPEG", quality=95)
-            return out.getvalue()
-
-    try:
-        return await asyncio.to_thread(to_jpeg, raw if isinstance(raw, bytes) else raw.read())
-    except Exception:
-        return None
-
-@router.callback_query(F.data.startswith("face_mkmodel_"))
-async def handle_face_mkmodel(call: CallbackQuery) -> None:
-    user_id = str(call.message.chat.id)
-    face = await _find_face_by_id(user_id, call.data[len("face_mkmodel_"):])
-    if not face:
-        await _safe_answer(call, "Лицо не найдено")
-        return
-    await _safe_answer(call, "Создаю модель...")
-    await _build_model_and_report(call.message.chat.id, user_id, face["name"], quiet_unavailable=False)
-
-@router.callback_query(F.data == "face_model_new")
-async def handle_face_model_new(call: CallbackQuery) -> None:
-    await _safe_answer(call)
-    msg = await bot.send_message(
-        call.message.chat.id,
-        "🧬 <b>Модель лица из нескольких фото</b>\n\n"
-        "Введите имя для нового лица (до 32 символов). Затем пришлите 3–10 фото одного человека "
-        "(можно альбомом, лучше «как файл»), а в конце отправьте слово <b>готово</b>.\n\n"
-        "Чем разнообразнее ракурсы и освещение при чётком лице, тем точнее модель.",
-        parse_mode="HTML")
-    register_next_step(msg.chat.id, model_name_step, call.message.chat.id)
-
-async def model_name_step(message, original_chat_id):
-    user_id = str(message.chat.id)
-    name = (message.text or "").strip().lower()
-    faces = await get_user_faces(user_id)
-    if name == "default":
-        name = f"face_{len(faces) + 1}"
-    if not _valid_face_name(name):
-        msg = await bot.send_message(message.chat.id, "❌ Некорректное имя (до 32 символов, без / \\ : * ? \" < > |). Введите другое имя:")
-        register_next_step(msg.chat.id, model_name_step, original_chat_id)
-        return
-    if any(f["name"] == name for f in faces):
-        msg = await bot.send_message(message.chat.id, f"❌ Лицо '{name}' уже существует. Введите другое имя:")
-        register_next_step(msg.chat.id, model_name_step, original_chat_id)
-        return
-    _model_sessions[user_id] = {"name": name, "photos": []}
-    msg = await bot.send_message(message.chat.id, f"📸 Присылайте фото для «{_h(name)}» (до {MODEL_MAX_PHOTOS}). Когда закончите — напишите <b>готово</b>.", parse_mode="HTML")
-    register_next_step(msg.chat.id, model_collect_step, original_chat_id)
-
-async def model_collect_step(message, original_chat_id):
-    user_id = str(message.chat.id)
-    session = _model_sessions.get(user_id)
-    if session is None:
-        await bot.send_message(message.chat.id, "❌ Сессия создания модели не найдена. Начните заново из меню лиц.")
-        return
-    text = (message.text or "").strip().lower()
-    if text in ("готово", "done", "/done"):
-        _model_sessions.pop(user_id, None)
-        photos = session["photos"]
-        if not photos:
-            await bot.send_message(message.chat.id, "❌ Фото не получено, модель не создана.")
-            return
-        name = session["name"]
-        if not await save_user_face(user_id, io.BytesIO(photos[0]), name):
-            await bot.send_message(message.chat.id, "❌ Ошибка при сохранении лица.")
-            return
-        await bot.send_message(message.chat.id, f"✅ Лицо <b>{_h(name)}</b> сохранено ({len(photos)} фото).", parse_mode="HTML")
-        await _build_model_and_report(message.chat.id, user_id, name, extra_images=photos, quiet_unavailable=False)
-        return
-    # Перерегистрируемся СРАЗУ: фото альбома приходят пачкой и не должны проскакивать в другие обработчики
-    register_next_step(message.chat.id, model_collect_step, original_chat_id)
-    if len(session["photos"]) >= MODEL_MAX_PHOTOS:
-        await bot.send_message(message.chat.id, f"Достигнут лимит {MODEL_MAX_PHOTOS} фото — напишите <b>готово</b>.", parse_mode="HTML")
-        return
-    try:
-        jpeg = await _download_face_jpeg(message)
-    except Exception as e:
-        await bot.send_message(message.chat.id, f"❌ Ошибка загрузки: {_h(_cut(e, 200))}", parse_mode="HTML")
-        return
-    if jpeg is None:
-        await bot.send_message(message.chat.id, "❌ Нужно фото (или картинка файлом). Либо напишите <b>готово</b>.", parse_mode="HTML")
-        return
-    ok, reason = await check_face_photo(jpeg)
-    if not ok:
-        await bot.send_message(message.chat.id, f"❌ Фото пропущено: {_h(reason)}", parse_mode="HTML")
-        return
-    session["photos"].append(jpeg)
-    await bot.send_message(message.chat.id, f"✅ Принято фото {len(session['photos'])}/{MODEL_MAX_PHOTOS}. Ещё или <b>готово</b>.", parse_mode="HTML")
 
 # =========== НАСТРОЙКИ (CALLBACK) ===========
 
@@ -2654,24 +2473,32 @@ async def repeat_confirm(call: CallbackQuery) -> None:
         try:
             # Точный повтор: промпты берутся ровно такими, какие ушли в WebUI в прошлый раз
             # (без повторного перевода через Ollama, без дублирования LoRA и новых «фраз разнообразия»)
-            face_ctx = await get_face_context(user_id) if config.get('face_enabled', False) else None
-            if face_ctx and face_ctx.note:
-                await on_status(f"⚠️ {face_ctx.note}")
             image_file, used_seed, original_prompt, processed_prompt = await generate_image(
                 config['prompt'], dict(config['settings']), user_id, on_progress, on_status, fixed_seed=config['seed'],
-                exact_prompt=config.get('final_prompt'), exact_negative=config.get('final_negative'),
-                face_image=face_ctx.image if face_ctx and face_ctx.use_faceid else None,
-                face_weights=face_ctx.weights if face_ctx else None
+                exact_prompt=config.get('final_prompt'), exact_negative=config.get('final_negative')
             )
             final_image_file = image_file
-            swapped = False
-            if face_ctx and face_ctx.use_swap:
-                await on_status("🎭 Заменяю лицо...")
-                final_image_file, swapped = await apply_face_swap(face_ctx, image_file)
-            face_replacement_success = bool(face_ctx and (face_ctx.use_faceid or swapped))
+            face_replacement_success = False
+            if REACTOR_AVAILABLE and config.get('face_enabled', False):
+                active_face = await get_active_face(user_id)
+                if active_face:
+                    try:
+                        await on_status("🎭 Заменяю лицо...")
+                        final_image_file = await swap_face_with_reactor(
+                            source_image=active_face,
+                            target_image=image_file,
+                            face_model="None",
+                            upscaler="None",
+                            face_restorer="GFPGAN",
+                            restorer_visibility=1.0
+                        )
+                        face_replacement_success = True
+                    except Exception as e:
+                        print(f"Ошибка замены лица: {e}")
+                        final_image_file = image_file
             try:
                 await bot.delete_message(chat_id, task.status_message_id)
-            except Exception:
+            except:
                 pass
             cfg = config['settings']
             caption = (
@@ -2682,7 +2509,8 @@ async def repeat_confirm(call: CallbackQuery) -> None:
                 f"🎚️ <b>CFG:</b> {cfg.get('cfg_scale')}\n"
                 f"🎲 <b>Seed:</b> <code>{used_seed}</code> (повтор)\n"
             )
-            caption += _face_caption_line(face_ctx, swapped)
+            if face_replacement_success:
+                caption += "🎭 <b>Лицо заменено</b>\n"
             sent_msg = await send_image_smart(chat_id, final_image_file, caption=caption, parse_mode="HTML")
             last_images[user_id] = final_image_file
             last_message_ids[user_id] = sent_msg.message_id
@@ -2810,14 +2638,28 @@ async def handle_extended_neg_choice(call: CallbackQuery) -> None:
 # =========== РЕДАКТИРОВАНИЕ (IMG2IMG) ===========
 
 async def apply_face_replacement_if_enabled(user_id, image):
-    # Правка готового изображения: FaceID тут не при чём, лицо ставится ReActor-заменой (по модели, если она есть)
-    ctx = await get_face_context(user_id, allow_faceid=False)
-    if not ctx or not ctx.use_swap:
+    if not REACTOR_AVAILABLE:
         return image
-    print(f"🎭 Применяю замену лица для пользователя {user_id}")
-    result, ok = await apply_face_swap(ctx, image)
-    print("✅ Замена лица выполнена успешно" if ok else "❌ Замена лица не удалась")
-    return result
+    if not await get_face_enabled(user_id):
+        return image
+    active_face = await get_active_face(user_id)
+    if not active_face:
+        return image
+    try:
+        print(f"🎭 Применяю замену лица для пользователя {user_id}")
+        result = await swap_face_with_reactor(
+            source_image=active_face,
+            target_image=image,
+            face_model="None",
+            upscaler="None",
+            face_restorer="GFPGAN",
+            restorer_visibility=1.0
+        )
+        print("✅ Замена лица выполнена успешно")
+        return result
+    except Exception as e:
+        print(f"❌ Ошибка замены лица: {e}")
+        return image
 
 @router.callback_query(F.data == "action_img2img")
 async def show_edit_options(call: CallbackQuery) -> None:
@@ -2942,7 +2784,7 @@ async def process_edit_prompt(message, edit_type, user_id, original_msg_id):
             final_image = await apply_face_replacement_if_enabled(user_id, new_image)
             try:
                 await bot.delete_message(message.chat.id, task.status_message_id)
-            except Exception:
+            except:
                 pass
             sent_msg = await send_image_smart(message.chat.id, final_image,
                                         caption=f"✅ Редактирование <b>{_h(edit_type)}</b>\nПромпт: <code>{_h(_cut(prompt, 800))}</code>", parse_mode="HTML")
@@ -3013,20 +2855,16 @@ async def handle_manage_lora(call: CallbackQuery) -> None:
     available = await get_available_loras()
     lora_enabled = await get_user_lora_enabled(user_id)
     markup = types.InlineKeyboardMarkup(row_width=2)
-    lora_weights = await get_user_lora_weights(user_id)
     for lora_name, info in available.items():
         status = "✅" if lora_enabled.get(lora_name, True) else "❌"
-        btn_text = _cut(f"{status} {info['name']}", 40)
+        btn_text = _cut(f"{status} {info['name']}", 60)
         # callback_data у Telegram ограничена 64 байтами — длинные/русские имена LoRA её превышали и ломали меню
-        markup.add(
-            types.InlineKeyboardButton(btn_text, callback_data=f"lora_toggle_{_lora_id(lora_name)}"),
-            types.InlineKeyboardButton(f"⚖️ {lora_weights.get(lora_name, 1.0):g}", callback_data=f"lora_weight_{_lora_id(lora_name)}"),
-        )
+        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"lora_toggle_{_lora_id(lora_name)}"))
     # Кнопка обновления списка
     markup.add(types.InlineKeyboardButton("🔄 Обновить список LoRA", callback_data="refresh_lora_list"))
     markup.add(types.InlineKeyboardButton("◀️ Назад в настройки", callback_data="back_to_settings"))
 
-    text = f"🎛️ **Управление LoRA**\n\nНажмите на название — включить/отключить, на ⚖️ — сменить вес (0.4 → 0.6 → 0.8 → 1.0 → 1.2).\nВключённые LoRA автоматически добавляются в промпт при генерации.\n\nДоступно: {len(available)} LoRA"
+    text = f"🎛️ **Управление LoRA**\n\nВыберите LoRA для включения/отключения.\nОни будут автоматически добавляться в промпт при генерации.\n\nДоступно: {len(available)} LoRA"
 
     try:
         await bot.edit_message_text(
@@ -3070,19 +2908,6 @@ async def handle_lora_toggle(call: CallbackQuery) -> None:
     status = "включена ✅" if new_state else "выключена ❌"
     await _safe_answer(call, f"LoRA {available[lora_name]['name']} {status}"[:200])
     # Перерисовываем меню (редактируем то же сообщение)
-    await handle_manage_lora(call)
-
-@router.callback_query(F.data.startswith("lora_weight_"))
-async def handle_lora_weight(call: CallbackQuery) -> None:
-    user_id = str(call.message.chat.id)
-    lora_id = call.data[len("lora_weight_"):]
-    available = await get_available_loras()
-    lora_name = next((name for name in available if _lora_id(name) == lora_id), None)
-    if lora_name is None:
-        await _safe_answer(call, "❌ LoRA не найдена — обновите список", show_alert=True)
-        return
-    weight = await cycle_user_lora_weight(user_id, lora_name)
-    await _safe_answer(call, f"Вес {available[lora_name]['name']}: {weight:g}"[:200])
     await handle_manage_lora(call)
 
 @router.callback_query(F.data == "refresh_lora_list")
