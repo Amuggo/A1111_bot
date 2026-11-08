@@ -58,7 +58,8 @@ from settings import (
     update_user_settings, get_available_embeddings, refresh_embeddings_on_server,
     get_user_negative_embeddings, toggle_user_negative_embedding, set_user_negative_embeddings,
     get_available_samplers, get_user_sampler, set_user_sampler, get_active_lora_tags,
-    hires_plan, HIRES_MAX_SIDE, MAX_PRESETS, list_presets, save_preset, apply_preset, delete_preset
+    hires_plan, HIRES_MAX_SIDE, MAX_PRESETS, list_presets, save_preset, apply_preset, delete_preset,
+    list_global_presets, save_global_preset, apply_global_preset, delete_global_preset, STANDARD_PRESET_NAME
 )
 from face_manager import (
     save_user_face, get_user_faces, get_active_face, set_active_face,
@@ -72,6 +73,7 @@ from face_manager import (
 from face_check import check_face_photo
 
 import subscriptions  # noqa: E402
+import legal  # noqa: E402  (условия, дисклеймеры)
 from task_queue import QueueFull, Task, TaskQueue  # noqa: E402
 from http_client import close_session  # noqa: E402
 import app_config as config  # noqa: E402  (загружает .env и переменные окружения)
@@ -212,6 +214,7 @@ BUTTON_TEXTS = [
     "🔍 Апскейл",
     "🎭 Управление лицом",
     "🎮 ControlNet",
+    "💳 Подписка",
 ]
 
 # ===== ПЕРЕВОД КАТЕГОРИЙ (оставлены здесь, т.к. только для отображения) =====
@@ -268,14 +271,30 @@ def make_callbacks(task):
 
     return on_progress, on_status
 
+async def _task_cost(user_id, kind) -> float:
+    """Сколько токенов стоит задача: апскейл, обычная генерация или генерация с лицом (лицо включено и выбрано)."""
+    if kind == "upscale":
+        return subscriptions.COST_UPSCALE
+    try:
+        import face_manager
+        uid = str(user_id)
+        if await face_manager.get_face_enabled(uid) and await face_manager.get_active_face_name(uid):
+            return subscriptions.COST_FACE
+    except Exception:
+        pass
+    return subscriptions.COST_GENERATION
+
 async def enqueue(chat_id, user_id, kind, job, reply_to_message_id=None):
     """Ставит задачу в очередь и сразу отвечает «⏳ Задача №N в очереди». Возвращает Task или None (очередь полна)."""
     if task_queue is None:
         await bot.send_message(chat_id, "⚠️ Бот ещё запускается, повторите через несколько секунд.")
         return None
     try:
-        # Тестовые подписки: дневной лимит по тарифу (если система включена админом)
-        denial = await subscriptions.check_and_consume(user_id)
+        # Без принятия условий использования генерация недоступна
+        if not await _terms_gate(chat_id, user_id):
+            return None
+        # Списание токенов (Pro и админы не платят; если система подписок выключена — без списаний)
+        denial = await subscriptions.check_and_consume(user_id, await _task_cost(user_id, kind))
         if denial:
             await bot.send_message(chat_id, denial, reply_to_message_id=reply_to_message_id)
             return None
@@ -435,7 +454,7 @@ def _is_photo_rejected(error):
     ))
 
 async def send_image_smart(chat_id, image, caption=None, parse_mode=None, reply_to_message_id=None,
-                     reply_markup=None, filename=None, force_document=False):
+                     reply_markup=None, filename=None, force_document=False, disclaimer=True):
     """
     Отправляет картинку как фото, а если она не подходит под лимиты Telegram по весу/разрешению/пропорциям
     (или фото отклонено сервером) — как файл. Возвращает объект отправленного сообщения.
@@ -453,6 +472,11 @@ async def send_image_smart(chat_id, image, caption=None, parse_mode=None, reply_
 
     def make_caption(is_document):
         text = caption or ""
+        if text is not None and disclaimer:
+            line = legal.disclaimer(face=("🎭" in text))
+            if parse_mode != "HTML":
+                line = re.sub(r"<[^>]+>", "", line)
+            text = (text.rstrip() + "\n\n" + line) if text.strip() else line
         if is_document and reason and reason != "по запросу":
             text += f"\n📎 Отправлено файлом без сжатия ({reason})"
         return text
@@ -518,9 +542,10 @@ def get_main_keyboard():
     btn_upscale = types.KeyboardButton("🔍 Апскейл")
     btn_face = types.KeyboardButton("🎭 Управление лицом")
     btn_controlnet = types.KeyboardButton("🎮 ControlNet")
+    btn_sub = types.KeyboardButton("💳 Подписка")
     markup.row(btn_generate, btn_settings)
     markup.row(btn_upscale, btn_face)
-    markup.row(btn_controlnet)
+    markup.row(btn_controlnet, btn_sub)
     return markup
 
 async def get_settings_inline_keyboard(settings, user_id):
@@ -627,7 +652,7 @@ async def controlnet_menu(message: Message) -> None:
     user_id = str(message.chat.id)
     sources = await get_controlnet_sources()
     if not sources:
-        await bot.send_message(message.chat.id, "❌ В папке `controlnet_images` нет изображений или читаемых .parquet.\nДобавьте туда скелеты (PNG, JPG, Parquet) и попробуйте снова.", parse_mode="Markdown")
+        await bot.send_message(message.chat.id, "❌ В папке `data/controlnet_images` нет изображений или читаемых .parquet.\nДобавьте туда скелеты (PNG, JPG, Parquet) и попробуйте снова.", parse_mode="Markdown")
         return
 
     # Собираем уникальные категории
@@ -833,7 +858,7 @@ async def handle_controlnet_refresh(call: CallbackQuery) -> None:
     user_id = str(call.message.chat.id)
     sources = await get_controlnet_sources()
     if not sources:
-        await bot.edit_message_text("❌ Нет доступных поз. Добавьте файлы в папку controlnet_images", call.message.chat.id, call.message.message_id)
+        await bot.edit_message_text("❌ Нет доступных поз. Добавьте файлы в папку data/controlnet_images", call.message.chat.id, call.message.message_id)
         await bot.answer_callback_query(call.id)
         return
 
@@ -1343,12 +1368,27 @@ async def send_welcome(message: Message) -> None:
     parts = (message.text or "").split(maxsplit=1)
     if is_new and len(parts) == 2 and parts[1].startswith("ref_"):
         await _handle_referral_start(message, parts[1][4:])
+    granted = await subscriptions.claim_welcome(uid)
+    plan_line = await _plan_badge(uid)
+    gift = f"\n🎁 Дарим вам {subscriptions.fmt_tokens(granted)} токена на старт!" if granted else ""
     await bot.send_message(
         message.chat.id,
-        "🤖 **Stable Diffusion Бот**\n\n📝 **Быстрая генерация:** просто отправь любой текст\n\n🚀 **Сгенерировать** - расширенный режим\n⚙️ **Настройки** - изменить параметры\n🔍 **Апскейл** - увеличить картинку (или просто пришли мне любое фото)\n🧩 **Модель** - выбор в настройках или командой /model\n🎭 **Управление лицом** - добавление нескольких лиц для замены",
-        parse_mode="Markdown",
+        "🎨 <b>Stable Diffusion Бот</b>\n"
+        f"{plan_line}{gift}\n\n"
+        "✍️ <b>Быстрая генерация</b> — просто отправьте текст\n"
+        "🚀 <b>Сгенерировать</b> — расширенный режим\n"
+        "⚙️ <b>Настройки</b> — модель, размер и другое\n"
+        "🔍 <b>Апскейл</b> — увеличить картинку (или пришлите любое фото)\n"
+        "🎭 <b>Управление лицом</b> — свои лица для генерации\n"
+        "💳 <b>Подписка</b> — токены, тариф, оплата\n"
+        f"🪙 Картинка — {subscriptions.fmt_tokens(subscriptions.COST_GENERATION)}, с лицом — {subscriptions.fmt_tokens(subscriptions.COST_FACE)}, "
+        f"апскейл — {subscriptions.fmt_tokens(subscriptions.COST_UPSCALE)}\n\n"
+        "<i>Изображения создаются нейросетью. Условия использования: /terms</i>",
+        parse_mode="HTML",
         reply_markup=get_main_keyboard()
     )
+    if not await subscriptions.terms_accepted(uid, legal.TERMS_VERSION):
+        await _send_terms(message.chat.id)
 
 @router.message(F.text == "🚀 Сгенерировать")
 async def extended_generation_start(message: Message) -> None:
@@ -1847,23 +1887,185 @@ async def _handle_referral_start(message: Message, referrer: str) -> None:
     if not result["ok"]:
         return
     if result["credits"]:
-        await bot.send_message(message.chat.id, f"🎁 Вы пришли по приглашению — вам начислено {result['credits']} бонусных генераций!")
+        await bot.send_message(message.chat.id, f"🎁 Вы пришли по приглашению — вам начислено {subscriptions.fmt_tokens(result['credits'])} токенов!")
         try:
-            await bot.send_message(int(referrer), f"🎁 По вашей ссылке пришёл новый пользователь — вам {result['credits']} бонусных генераций. /plan")
+            await bot.send_message(int(referrer), f"🎁 По вашей ссылке пришёл новый пользователь — вам {subscriptions.fmt_tokens(result['credits'])} токенов. /plan")
         except Exception as e:
             print(f"⚠️ Не удалось уведомить пригласившего: {e}")
 
+# =========== УСЛОВИЯ И УПРАВЛЕНИЕ ПОДПИСКОЙ (UI) ===========
+
+def _terms_accept_markup():
+    return types.InlineKeyboardMarkup(row_width=1).add(
+        types.InlineKeyboardButton("✅ Принимаю условия", callback_data="terms_accept"))
+
+async def _send_terms(chat_id) -> None:
+    await bot.send_message(chat_id, legal.terms_text(), parse_mode="HTML", reply_markup=_terms_accept_markup())
+
+async def _terms_gate(chat_id, user_id) -> bool:
+    """True — условия приняты. Иначе показывает их с кнопкой «Принимаю» и возвращает False."""
+    if await subscriptions.terms_accepted(str(user_id), legal.TERMS_VERSION):
+        return True
+    await bot.send_message(chat_id, "📜 Чтобы продолжить, примите условия использования. После этого повторите запрос.")
+    await _send_terms(chat_id)
+    return False
+
+@router.message(Command("terms"))
+async def terms_command(message: Message):
+    if await subscriptions.terms_accepted(str(message.chat.id), legal.TERMS_VERSION):
+        await bot.send_message(message.chat.id, legal.terms_text(), parse_mode="HTML")
+    else:
+        await _send_terms(message.chat.id)
+
+@router.callback_query(F.data == "terms_accept")
+async def handle_terms_accept(call: CallbackQuery) -> None:
+    await subscriptions.accept_terms(str(call.from_user.id), legal.TERMS_VERSION)
+    await _safe_answer(call, "Условия приняты ✅")
+    await _replace_message(call, "✅ <b>Условия использования приняты.</b>\nМожно генерировать: отправьте текстовое описание картинки.\n"
+                                 "Тариф и оплата — кнопка «💳 Подписка».")
+
+def _days_left(expires) -> str:
+    if expires is None:
+        return "бессрочно"
+    days = max(0, int((expires - time.time()) // 86400))
+    return f"{days} дн." + (" ⚠️ скоро закончится" if days <= 3 else "")
+
+async def _plan_badge(uid: str) -> str:
+    """Одна строка про тариф для приветствия."""
+    if not await subscriptions.is_enabled():
+        return "✨ Без ограничений"
+    if await subscriptions.is_admin(uid):
+        return "👑 Администратор"
+    plan, expires = await subscriptions.get_plan(uid)
+    if plan == "pro":
+        return f"⭐ Pro ({subscriptions.fmt_expires(expires)})"
+    return f"🪙 Токенов: {subscriptions.fmt_tokens(await subscriptions.balance(uid))}"
+
+async def _sub_menu(uid: str):
+    """(текст, клавиатура) главного экрана подписки."""
+    mk = types.InlineKeyboardMarkup(row_width=1)
+    if not await subscriptions.is_enabled():
+        return "ℹ️ <b>Подписки отключены</b> — ограничений по тарифу нет.", mk
+    ref = await subscriptions.referral_info(uid)
+    if await subscriptions.is_admin(uid):
+        text = "💳 <b>Моя подписка</b>\n\n👑 Вы администратор — лимиты и ограничения на вас не действуют."
+        mk.add(types.InlineKeyboardButton("📜 Условия подписки", callback_data="sub_terms"))
+        return text, mk
+    plan, expires = await subscriptions.get_plan(uid)
+    fmt = subscriptions.fmt_tokens
+    lines = ["💳 <b>Моя подписка</b>", ""]
+    if plan == "pro":
+        lines += ["⭐ Тариф: <b>Pro</b>", f"📅 Действует: {subscriptions.fmt_expires(expires)}", f"⏳ Осталось: {_days_left(expires)}",
+                  f"🪙 Токены на Pro не тратятся (на балансе {fmt(ref['credits'])})"]
+    else:
+        lines += ["🆓 Тариф: <b>Free</b>", f"🪙 Токенов: <b>{fmt(ref['credits'])}</b>"]
+    lines += ["", f"Картинка — {fmt(subscriptions.COST_GENERATION)}, с лицом — {fmt(subscriptions.COST_FACE)}, апскейл — {fmt(subscriptions.COST_UPSCALE)}.",
+              "Pro: без трат токенов и с тонкими настройками." if plan == "free" else "Спасибо, что вы с нами! 💛"]
+    if await subscriptions.payments_enabled():
+        mk.add(types.InlineKeyboardButton("🔄 Продлить Pro" if plan == "pro" else "⭐ Оформить Pro", callback_data="sub_buy"))
+    else:
+        lines += ["", "ℹ️ Онлайн-оплата сейчас недоступна — тариф выдаёт администратор."]
+    mk.add(types.InlineKeyboardButton("🧾 История платежей", callback_data="sub_history"),
+           types.InlineKeyboardButton("👥 Пригласить друзей", callback_data="sub_ref"),
+           types.InlineKeyboardButton("📜 Условия подписки", callback_data="sub_terms"))
+    if plan == "pro":
+        mk.add(types.InlineKeyboardButton("🚫 Завершить подписку", callback_data="sub_cancel"))
+    return "\n".join(lines), mk
+
+def _back_markup(extra=None):
+    mk = types.InlineKeyboardMarkup(row_width=1)
+    for b in extra or []:
+        mk.add(b)
+    mk.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="sub_menu"))
+    return mk
+
 @router.message(Command("plan"))
+@router.message(F.text == "💳 Подписка")
 async def plan_command(message: Message):
-    """/plan — тариф, лимиты, бонусы, кнопки оплаты (если админ включил оплату) и реферальная ссылка."""
-    uid = str(message.chat.id)
-    text = await subscriptions.describe(uid, await _bot_username())
-    markup = None
-    if await subscriptions.is_enabled() and await subscriptions.payments_enabled():
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        markup.add(*[types.InlineKeyboardButton(f"⭐ {p['title']} — {p['stars']}", callback_data=f"buy_{key}")
-                     for key, p in subscriptions.PRODUCTS.items()])
+    """Главный экран управления подпиской (/plan и кнопка «💳 Подписка»)."""
+    text, markup = await _sub_menu(str(message.chat.id))
     await bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+@router.callback_query(F.data == "sub_menu")
+async def handle_sub_menu(call: CallbackQuery) -> None:
+    await _safe_answer(call)
+    text, markup = await _sub_menu(str(call.from_user.id))
+    await _replace_message(call, text, markup)
+
+@router.callback_query(F.data == "sub_buy")
+async def handle_sub_buy(call: CallbackQuery) -> None:
+    if not (await subscriptions.is_enabled() and await subscriptions.payments_enabled()):
+        await _safe_answer(call, "Оплата сейчас недоступна", show_alert=True)
+        return
+    await _safe_answer(call)
+    plan, expires = await subscriptions.get_plan(str(call.from_user.id))
+    head = ("🔄 <b>Продление Pro</b>\nСрок прибавится к текущему." if plan == "pro" else "⭐ <b>Оформление Pro</b>")
+    lines = [head, "", "Выберите срок. Оплата — Telegram Stars, автопродления нет.", ""]
+    mk = types.InlineKeyboardMarkup(row_width=1)
+    for key, p in subscriptions.PRODUCTS.items():
+        per_day = p["stars"] / p["days"]
+        mk.add(types.InlineKeyboardButton(f"⭐ {p['title']} — {p['stars']} ({per_day:.1f}/день)", callback_data=f"buy_{key}"))
+    mk.add(types.InlineKeyboardButton("📜 Условия подписки", callback_data="sub_terms"))
+    mk.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="sub_menu"))
+    lines.append("Нажимая на тариф, вы соглашаетесь с условиями подписки.")
+    await _replace_message(call, "\n".join(lines), mk)
+
+@router.callback_query(F.data == "sub_terms")
+async def handle_sub_terms(call: CallbackQuery) -> None:
+    await _safe_answer(call)
+    await _replace_message(call, legal.subscription_terms_text(
+        subscriptions.PRODUCTS, subscriptions.fmt_tokens(subscriptions.WELCOME_TOKENS), subscriptions.fmt_tokens(subscriptions.COST_GENERATION),
+        subscriptions.fmt_tokens(subscriptions.COST_FACE), subscriptions.fmt_tokens(subscriptions.COST_UPSCALE)), _back_markup())
+
+@router.callback_query(F.data == "sub_history")
+async def handle_sub_history(call: CallbackQuery) -> None:
+    await _safe_answer(call)
+    rows = await subscriptions.user_payments(str(call.from_user.id), limit=8)
+    if not rows:
+        text = "🧾 <b>История платежей</b>\n\nПлатежей пока нет."
+    else:
+        lines = ["🧾 <b>История платежей</b>", ""]
+        for p in rows:
+            title = subscriptions.PRODUCTS.get(p["product"], {}).get("title", p["product"])
+            mark = " (возвращён)" if p.get("refunded") else ""
+            lines.append(f"• {time.strftime('%d.%m.%Y', time.localtime(p['ts']))} — {_h(title)}, {p['stars']}⭐{mark}")
+        lines.append("\nВопросы по платежам: /paysupport")
+        text = "\n".join(lines)
+    await _replace_message(call, text, _back_markup())
+
+@router.callback_query(F.data == "sub_ref")
+async def handle_sub_ref(call: CallbackQuery) -> None:
+    await _safe_answer(call)
+    text = await subscriptions.describe_referral(str(call.from_user.id), await _bot_username())
+    await _replace_message(call, text, _back_markup())
+
+@router.callback_query(F.data == "sub_cancel")
+async def handle_sub_cancel(call: CallbackQuery) -> None:
+    await _safe_answer(call)
+    plan, expires = await subscriptions.get_plan(str(call.from_user.id))
+    if plan == "free":
+        await _replace_message(call, "У вас нет активной платной подписки.", _back_markup())
+        return
+    mk = types.InlineKeyboardMarkup(row_width=1)
+    mk.add(types.InlineKeyboardButton("🚫 Да, завершить сейчас", callback_data="sub_cancel_yes"),
+           types.InlineKeyboardButton("⬅️ Оставить подписку", callback_data="sub_menu"))
+    await _replace_message(
+        call,
+        "🚫 <b>Завершить подписку?</b>\n\n"
+        f"Сейчас Pro действует {subscriptions.fmt_expires(expires)}. Автопродления нет, поэтому лишних списаний не будет, "
+        "и подписка закончится сама.\n\n"
+        "Если завершить сейчас, <b>остаток срока сгорит</b>, деньги автоматически не возвращаются. "
+        "Аккаунт перейдёт на Free; настройки и лица сохранятся.", mk)
+
+@router.callback_query(F.data == "sub_cancel_yes")
+async def handle_sub_cancel_yes(call: CallbackQuery) -> None:
+    uid = str(call.from_user.id)
+    result = await subscriptions.cancel_subscription(uid)
+    await _safe_answer(call, "Подписка завершена" if result else "Активной подписки нет")
+    if result:
+        await _notify_admin(f"ℹ️ Пользователь {uid} досрочно завершил Pro ({subscriptions.fmt_expires(result['expires'])})")
+    text, markup = await _sub_menu(uid)
+    await _replace_message(call, ("✅ Подписка завершена. Вы на тарифе Free.\n\n" if result else "") + text, markup)
 
 @router.message(Command("invite"))
 async def invite_command(message: Message):
@@ -1885,8 +2087,11 @@ async def handle_buy(call: CallbackQuery) -> None:
     if not product or not (await subscriptions.is_enabled() and await subscriptions.payments_enabled()):
         await _safe_answer(call, "Оплата сейчас недоступна", show_alert=True)
         return
-    await _safe_answer(call)
     uid = call.message.chat.id
+    if not await _terms_gate(uid, uid):
+        await _safe_answer(call)
+        return
+    await _safe_answer(call)
     await bot.send_invoice(uid, title=f"Подписка {product['title']}",
                            description=f"Тариф Pro: без дневного лимита и с функциями лиц. Срок: {product['days']} дн.",
                            payload=f"sub:{call.data[len('buy_'):]}:{uid}", stars=product["stars"], label=product["title"])
@@ -2016,19 +2221,87 @@ def _preset_summary(preset: dict) -> str:
     hires = f", hires {preset.get('hires_scale')}x" if preset.get("hires_enabled") else ""
     return f"{_cut(model, 22)} · {preset.get('width')}×{preset.get('height')} · {preset.get('steps')} шагов{hires}"
 
+def _global_summary(entry: dict) -> str:
+    st = entry.get("settings") or {}
+    size = f"{st['width']}×{st['height']}, {st['steps']} шагов" if st.get("width") and st.get("steps") else ""
+    return " · ".join(x for x in (entry.get("desc"), size) if x)
+
 async def _show_presets_menu(chat_id: int, user_id: str, message_id: Optional[int] = None) -> None:
     presets = await list_presets(user_id)
+    shared = await list_global_presets()
+    is_adm = await subscriptions.is_admin(user_id)
     lines = [f"• <b>{_h(name)}</b> — {_h(_preset_summary(p))}" for name, p in presets.items()]
-    text = ("📦 <b>Пресеты</b>\n\nСохраняют модель, LoRA, негатив и эмбеддинги, размер, шаги, CFG, сэмплер и Hires — "
-            "переключение одним нажатием.\n\n" + ("\n".join(lines) if lines else "Пока нет ни одного. Настройте бота и нажмите «Сохранить текущие».")
-            + f"\n\nСохранено: {len(presets)}/{MAX_PRESETS}")
+    shared_lines = [f"• <b>{_h(name)}</b> — {_h(_global_summary(e))}" for name, e in shared.items()]
+    text = ("📦 <b>Пресеты</b>\n\nПресет переключает размер, шаги, CFG и другие настройки одним нажатием.\n\n"
+            "<b>Готовые для всех:</b>\n" + ("\n".join(shared_lines) if shared_lines else "пока нет")
+            + "\n\n<b>Мои:</b>\n" + ("\n".join(lines) if lines else "пока нет — настройте бота и нажмите «Сохранить текущие»")
+            + f"\n\nМоих: {len(presets)}/{MAX_PRESETS}")
     markup = types.InlineKeyboardMarkup(row_width=2)
+    for name in shared:
+        row = [types.InlineKeyboardButton(f"▶️ {_cut(name, 24)}", callback_data=f"gpreset_use_{_preset_id(name)}")]
+        if is_adm and name != STANDARD_PRESET_NAME:
+            row.append(types.InlineKeyboardButton("🗑", callback_data=f"gpreset_del_{_preset_id(name)}"))
+        markup.row(*row)
     for name in presets:
-        markup.row(types.InlineKeyboardButton(f"▶️ {_cut(name, 24)}", callback_data=f"preset_use_{_preset_id(name)}"),
+        markup.row(types.InlineKeyboardButton(f"👤 {_cut(name, 22)}", callback_data=f"preset_use_{_preset_id(name)}"),
                    types.InlineKeyboardButton("🗑", callback_data=f"preset_del_{_preset_id(name)}"))
     markup.add(types.InlineKeyboardButton("➕ Сохранить текущие настройки", callback_data="preset_save"))
+    if is_adm:
+        markup.add(types.InlineKeyboardButton("👑 Сохранить как общий пресет", callback_data="gpreset_save"))
     markup.add(types.InlineKeyboardButton("◀️ Назад", callback_data="back_to_settings"))
     await _edit_or_send(chat_id, message_id, text, markup)
+
+async def _gpreset_by_id(pid: str) -> Optional[str]:
+    return next((n for n in await list_global_presets() if _preset_id(n) == pid), None)
+
+@router.callback_query(F.data.startswith("gpreset_use_"))
+async def handle_gpreset_use(call: CallbackQuery) -> None:
+    user_id = str(call.message.chat.id)
+    name = await _gpreset_by_id(call.data[len("gpreset_use_"):])
+    if name is None or not await apply_global_preset(user_id, name):
+        await _safe_answer(call, "Пресет не найден", show_alert=True)
+        return
+    await _safe_answer(call, f"✅ Применён: {name}"[:200])
+    with suppress(Exception):
+        await bot.delete_message(call.message.chat.id, call.message.message_id)
+    await show_settings(call.message)
+
+@router.callback_query(F.data == "gpreset_save")
+async def handle_gpreset_save(call: CallbackQuery) -> None:
+    if not await subscriptions.is_admin(str(call.message.chat.id)):
+        await _safe_answer(call, "Только для администраторов", show_alert=True)
+        return
+    await _safe_answer(call)
+    msg = await bot.send_message(call.message.chat.id, "✏️ Название общего пресета (до 24 символов). Он сохранит ваши текущие настройки "
+                                 "и появится у всех пользователей. Такое же название перезапишется. /cancel — отмена.")
+    register_next_step(msg.chat.id, save_gpreset_name, call.message.message_id)
+
+async def save_gpreset_name(message: Message, menu_message_id: int) -> None:
+    user_id, name = str(message.chat.id), " ".join(_text(message).split())
+    if not await subscriptions.is_admin(user_id):
+        return
+    if _is_cancel_text(name) or len(name) > 24:
+        await bot.send_message(message.chat.id, "❌ Отменено: нужно короткое текстовое название (до 24 символов).")
+        return
+    result = await save_global_preset(user_id, name)
+    if result == "limit":
+        await bot.send_message(message.chat.id, "⚠️ Общих пресетов уже максимум — удалите ненужный (🗑).")
+    else:
+        await bot.send_message(message.chat.id, f"✅ Общий пресет «{name}» {'обновлён' if result == 'updated' else 'сохранён'}")
+    await _show_presets_menu(message.chat.id, user_id, None)
+    with suppress(Exception):
+        await bot.delete_message(message.chat.id, menu_message_id)
+
+@router.callback_query(F.data.startswith("gpreset_del_"))
+async def handle_gpreset_delete(call: CallbackQuery) -> None:
+    user_id = str(call.message.chat.id)
+    if not await subscriptions.is_admin(user_id):
+        await _safe_answer(call, "Только для администраторов", show_alert=True)
+        return
+    name = await _gpreset_by_id(call.data[len("gpreset_del_"):])
+    ok = bool(name) and await delete_global_preset(name)
+    await _safe_answer(call, f"🗑 Удалён: {name}" if ok else "Нельзя удалить")
+    await _show_presets_menu(call.message.chat.id, user_id, call.message.message_id)
 
 async def _preset_by_id(user_id: str, pid: str) -> Optional[str]:
     return next((n for n in await list_presets(user_id) if _preset_id(n) == pid), None)
@@ -2091,7 +2364,7 @@ async def handle_quick_generation(message: Message) -> None:
         return
     if message.text in BUTTON_TEXTS:
         return
-    if any(message.text.startswith(emoji) for emoji in ['🚀', '⚙️', '🔍', '🎭', '🎮']):
+    if any(message.text.startswith(emoji) for emoji in ['🚀', '⚙️', '🔍', '🎭', '🎮', '💳']):
         return
     if len(message.text.strip()) < 2:
         return
@@ -3536,7 +3809,8 @@ async def on_startup(bot: Bot):
             types.BotCommand("setsampler", "Выбрать сэмплер"),
             types.BotCommand("model", "Выбрать модель"),
             types.BotCommand("cancel", "Отменить мои задачи"),
-            types.BotCommand("plan", "Мой тариф, лимиты и оплата"),
+            types.BotCommand("plan", "Моя подписка, лимиты и оплата"),
+            types.BotCommand("terms", "Условия использования"),
             types.BotCommand("invite", "Пригласить друга (бонусы)"),
             types.BotCommand("paysupport", "Поддержка по платежам"),
             types.BotCommand("prompts", "Лог промптов (админ)"),

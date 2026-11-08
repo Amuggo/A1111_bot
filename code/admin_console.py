@@ -39,7 +39,7 @@ HELP = """\
   sub payments [N]      — последние платежи (id платежа нужен для возврата)
   sub refund <charge_id> — вернуть Stars пользователю и откатить дни подписки
   sub testpay <id> <товар> — имитировать успешную оплату (без Stars) вместе с реферальным бонусом
-  sub credits <id> <N>  — добавить (или отнять, если N<0) бонусные генерации
+  sub credits <id> <N>  — добавить (или отнять, если N<0) токены, можно дробные: 0.5
   sub ref <id>          — реферальная статистика пользователя
   admin add|remove <id> — выдать / забрать права администратора; admin list — список
   broadcast <all|pro|free> <текст> — рассылка: показывает предпросмотр и число получателей; затем
@@ -208,7 +208,8 @@ async def _cmd_sub(ctx, args):
         ctx.say(f"Подписки: {'ВКЛЮЧЕНЫ' if st['enabled'] else 'выключены'}{master}; выдано тарифов: {st['granted']}")
         ctx.say(f"Оплата Stars: {'ВКЛЮЧЕНА' if st['payments'] else 'выключена'}; платежей: {st['payments_count']} на {st['stars_total']}⭐; рефералов: {st['referrals']}")
         ctx.say("Активные тарифы: " + ", ".join(f"{name}: {n}" for name, n in st["active"].items()))
-        ctx.say(f"Лимит Free: {subs.PLANS['free']['daily']} генераций в день; Pro — без лимита, лица только на Pro")
+        ctx.say(f"Токены: на вход {subs.fmt_tokens(subs.WELCOME_TOKENS)}; генерация {subs.fmt_tokens(subs.COST_GENERATION)}, "
+                f"с лицом {subs.fmt_tokens(subs.COST_FACE)}, апскейл {subs.fmt_tokens(subs.COST_UPSCALE)}; Pro токены не тратит")
     elif action in ("on", "off"):
         await subs.set_enabled(action == "on")
         if action == "on" and not subs._master_on():
@@ -309,16 +310,20 @@ async def _cmd_sub(ctx, args):
         ctx.say(f"✅ Платёж возвращён, у {payment['user']} убавлено {payment['days']} дн. (реферальный бонус не отзывается)")
         await _notify(ctx, payment["user"], "ℹ️ Платёж возвращён, срок подписки скорректирован. /plan")
     elif action == "credits":
-        if len(rest) < 2 or not rest[0].lstrip("-").isdigit() or not rest[1].lstrip("-").isdigit():
+        try:
+            amount = float(rest[1].replace(",", ".")) if len(rest) > 1 else None
+        except ValueError:
+            amount = None
+        if len(rest) < 2 or not rest[0].lstrip("-").isdigit() or amount is None:
             ctx.say("Использование: sub credits <id> <N>")
             return
-        ctx.say(f"✅ Бонусных генераций у {rest[0]}: {await subs.add_credits(rest[0], int(rest[1]))}")
+        ctx.say(f"✅ Токенов у {rest[0]}: {subs.fmt_tokens(await subs.add_credits(rest[0], amount))}")
     elif action == "ref":
         if not rest:
             ctx.say("Использование: sub ref <id>")
             return
         info = await subs.referral_info(rest[0])
-        ctx.say(f"{rest[0]}: приглашено {info['invited']}, оплатили {info['paid']}, бонусных генераций {info['credits']}"
+        ctx.say(f"{rest[0]}: приглашено {info['invited']}, оплатили {info['paid']}, токенов {subs.fmt_tokens(info['credits'])}"
               + (f", пришёл от {info['referrer']}" if info["referrer"] else ""))
     elif action == "reset":
         if not rest:

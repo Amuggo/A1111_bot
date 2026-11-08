@@ -113,6 +113,10 @@ SETTINGS_FILE = os.path.join(DATA_DIR, get_env("SETTINGS_FILE_NAME", "user_setti
 FACE_SETTINGS_FILE = os.path.join(DATA_DIR, get_env("FACE_SETTINGS_FILE_NAME", "face_settings.json"))
 CONTROLNET_SETTINGS_FILE = os.path.join(DATA_DIR, get_env("CONTROLNET_SETTINGS_FILE_NAME", "controlnet_user_settings.json"))
 ADETAILER_SETTINGS_FILE = os.path.join(DATA_DIR, get_env("ADETAILER_SETTINGS_FILE_NAME", "adetailer_user_settings.json"))
+# Позы и референсы ControlNet (Parquet/PNG/JPG по папкам-категориям): data/controlnet_images/<категория>/
+CONTROLNET_IMAGES_DIR = os.path.join(DATA_DIR, get_env("CONTROLNET_IMAGES_DIR_NAME", "controlnet_images"))
+os.makedirs(CONTROLNET_IMAGES_DIR, exist_ok=True)
+
 SUBSCRIPTIONS_FILE = os.path.join(DATA_DIR, get_env("SUBSCRIPTIONS_FILE_NAME", "subscriptions.json"))
 PROMPT_LOG_FILE = os.path.join(DATA_DIR, get_env("PROMPT_LOG_FILE_NAME", "prompt_log.jsonl"))
 

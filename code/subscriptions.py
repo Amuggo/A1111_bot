@@ -1,8 +1,9 @@
 """
 Подписки, оплата Telegram Stars, реферальные бонусы и роли администраторов.
 
-Тарифы:  free — дневной лимит генераций (FREE_DAILY_LIMIT), функции лиц недоступны;
-         pro  — без лимита, лица доступны.
+Токены:  валюта генераций. 3 токена при первом входе (WELCOME_TOKENS), обычная генерация — 1, с лицом — 4,
+         апскейл — 0.5 (цены в .env). Токены тратят все, кроме Pro и администраторов.
+Тарифы:  free — генерации за токены, простые настройки; pro  — генерации без токенов, расширенные настройки.
 Оплата:  Telegram Stars (валюта XTR, платёжный провайдер не нужен). Товары — PRODUCTS (цены в .env).
 Рефералы: приглашённый по ссылке t.me/<бот>?start=ref_<id> и пригласивший получают бонусные генерации;
          когда приглашённый впервые оплачивает подписку, пригласивший получает дни Pro.
@@ -31,7 +32,26 @@ def _int_env(name: str, default: int, minimum: int = 0) -> int:
         return default
 
 
-FREE_DAILY_LIMIT = _int_env("FREE_DAILY_LIMIT", 10, 1)
+
+
+def _float_env(name: str, default: float, minimum: float = 0.0) -> float:
+    try:
+        return max(minimum, float(os.environ.get(name, "").strip().replace(",", ".") or default))
+    except ValueError:
+        return default
+
+
+WELCOME_TOKENS = _float_env("WELCOME_TOKENS", 3)            # токенов при первом входе
+COST_GENERATION = _float_env("COST_GENERATION", 1)          # обычная генерация
+COST_FACE = _float_env("COST_FACE", 4)                      # генерация с лицом
+COST_UPSCALE = _float_env("COST_UPSCALE", 0.5)              # апскейл
+
+
+def fmt_tokens(value) -> str:
+    """5 → «5», 0.5 → «0.5», 2.50 → «2.5»."""
+    value = round(float(value), 2)
+    return str(int(value)) if value == int(value) else f"{value:g}"
+
 REF_SIGNUP_CREDITS = _int_env("REF_SIGNUP_CREDITS", 5)     # бонусных генераций обоим при регистрации по ссылке
 REF_PURCHASE_DAYS = _int_env("REF_PURCHASE_DAYS", 7)       # дней Pro пригласившему за первую оплату приглашённого
 REF_MAX_INVITES = _int_env("REF_MAX_INVITES", 30, 1)       # сколько приглашений одного человека приносят бонусы
@@ -39,7 +59,7 @@ REF_MAX_INVITES = _int_env("REF_MAX_INVITES", 30, 1)       # сколько пр
 ADVANCED_FOR_FREE = os.environ.get("ADVANCED_FOR_FREE", "0").strip().lower() in ("1", "true", "yes")
 
 PLANS: Dict[str, dict] = {
-    "free": {"title": "Free", "daily": FREE_DAILY_LIMIT, "face": False, "advanced": ADVANCED_FOR_FREE},
+    "free": {"title": "Free", "daily": None, "face": True, "advanced": ADVANCED_FOR_FREE},   # лица для Free — за токены
     "pro": {"title": "Pro", "daily": None, "face": True, "advanced": True},   # daily=None — без лимита
 }
 
@@ -51,7 +71,7 @@ PRODUCTS: Dict[str, dict] = {
 
 def _default_data() -> dict:
     return {"enabled": True, "payments": True, "admins": [], "users": {}, "usage": {}, "credits": {},
-            "referrals": {}, "ref_rewarded": {}, "payment_log": [], "blocked": [], "ui_preview": {}}
+            "referrals": {}, "ref_rewarded": {}, "payment_log": [], "blocked": [], "ui_preview": {}, "terms": {}, "welcomed": []}
 
 
 def _master_on() -> bool:
@@ -195,55 +215,81 @@ class SubscriptionService:
     async def reset_usage(self, user_id: str) -> None:
         await self._store.aupdate(lambda d: (d.get("usage") or {}).pop(str(user_id), None))
 
-    async def add_credits(self, user_id: str, amount: int) -> int:
+    async def add_credits(self, user_id: str, amount: float) -> float:
+        """Начисляет (или списывает, если amount < 0) токены. Возвращает новый баланс."""
         def mutate(data: dict):
             credits = data.setdefault("credits", {})
-            credits[str(user_id)] = max(0, int(credits.get(str(user_id), 0)) + int(amount))
+            credits[str(user_id)] = max(0.0, round(float(credits.get(str(user_id), 0)) + float(amount), 2))
             return credits[str(user_id)]
         return await self._store.aupdate(mutate)
 
     # ---------- ограничения ----------
-    async def check_and_consume(self, user_id: str) -> Optional[str]:
-        """Перед постановкой задачи в очередь. None — можно (лимит или бонус списан), иначе — текст отказа."""
+    async def claim_welcome(self, user_id: str) -> float:
+        """Один раз выдаёт приветственные токены. Возвращает выданное количество (0 — уже выдавали / не положено)."""
         uid = str(user_id)
 
+        def mutate(data: dict) -> float:
+            welcomed = data.setdefault("welcomed", [])
+            if uid in welcomed:
+                return 0.0
+            welcomed.append(uid)
+            if not _on(data) or uid in _admins(data) or WELCOME_TOKENS <= 0:
+                return 0.0
+            credits = data.setdefault("credits", {})
+            credits[uid] = round(float(credits.get(uid, 0)) + WELCOME_TOKENS, 2)
+            return WELCOME_TOKENS
+
+        return await self._store.aupdate(mutate)
+
+    async def balance(self, user_id: str) -> float:
+        return float(((await self._store.aread()).get("credits") or {}).get(str(user_id), 0))
+
+    async def check_and_consume(self, user_id: str, cost: float = None) -> Optional[str]:
+        """Перед постановкой задачи в очередь. None — можно (токены списаны), иначе — текст отказа.
+        Администраторы и Pro токены не тратят."""
+        uid = str(user_id)
+        cost = COST_GENERATION if cost is None else float(cost)
+
         def mutate(data: dict) -> Optional[str]:
+            welcomed = data.setdefault("welcomed", [])
+            credits = data.setdefault("credits", {})
+            if uid not in welcomed:                      # первый вход: приветственные токены
+                welcomed.append(uid)
+                if _on(data) and uid not in _admins(data) and WELCOME_TOKENS > 0:
+                    credits[uid] = round(float(credits.get(uid, 0)) + WELCOME_TOKENS, 2)
+            usage = data.setdefault("usage", {}).setdefault(uid, {})
+            usage["charged"] = 0.0
             if not _on(data) or uid in _admins(data):
                 return None
             plan, _ = _active_plan(data, uid)
-            limit = PLANS[plan]["daily"]
-            if limit is None:
+            if plan == "pro":
                 return None
-            usage = data.setdefault("usage", {}).setdefault(uid, {})
+            have = float(credits.get(uid, 0))
+            if have + 1e-9 < cost:
+                return (f"🪙 Не хватает токенов: нужно {fmt_tokens(cost)}, у вас {fmt_tokens(have)}.\n"
+                        "Токены можно получить, пригласив друзей, или оформить Pro без трат токенов: /plan")
+            credits[uid] = round(have - cost, 2)
+            usage["charged"] = cost
             if usage.get("day") != _today():
                 usage.update(day=_today(), count=0)
-            usage["credit_used"] = False
-            if usage["count"] >= limit:
-                credits = data.setdefault("credits", {})
-                if credits.get(uid, 0) > 0:      # дневной лимит исчерпан — тратим бонусную генерацию
-                    credits[uid] -= 1
-                    usage["credit_used"] = True
-                    return None
-                return (f"⛔ Дневной лимит тарифа {PLANS[plan]['title']} исчерпан (лимит: {limit} в день). "
-                        "Лимит обновится завтра. Тариф и бонусы: /plan")
-            usage["count"] += 1
+            usage["count"] = usage.get("count", 0) + 1
             return None
 
         return await self._store.aupdate(mutate)
 
     async def refund(self, user_id: str) -> None:
-        """Возвращает списанную генерацию (если задачу не удалось поставить в очередь)."""
+        """Возвращает токены за последнюю постановку (если задачу не удалось поставить в очередь)."""
         uid = str(user_id)
 
         def mutate(data: dict):
             usage = (data.get("usage") or {}).get(uid)
-            if not usage or usage.get("day") != _today():
+            charged = float((usage or {}).get("charged", 0))
+            if charged <= 0:
                 return
-            if usage.get("credit_used"):
-                data.setdefault("credits", {})[uid] = data.get("credits", {}).get(uid, 0) + 1
-                usage["credit_used"] = False
-            elif usage.get("count", 0) > 0:
-                usage["count"] -= 1
+            credits = data.setdefault("credits", {})
+            credits[uid] = round(float(credits.get(uid, 0)) + charged, 2)
+            usage["charged"] = 0.0
+            usage["count"] = max(0, usage.get("count", 0) - 1)
 
         await self._store.aupdate(mutate)
 
@@ -344,6 +390,42 @@ class SubscriptionService:
     async def list_payments(self, limit: int = 15) -> List[dict]:
         return list(reversed((await self._store.aread()).get("payment_log") or []))[:limit]
 
+    # ---------- согласие с условиями ----------
+    async def terms_accepted(self, user_id: str, version: str) -> bool:
+        """Принял ли пользователь актуальную версию условий. Администраторы и выключенные подписки — без проверки."""
+        data = await self._store.aread()
+        if str(user_id) in _admins(data):
+            return True
+        entry = (data.get("terms") or {}).get(str(user_id))
+        return bool(entry) and entry.get("version") == str(version)
+
+    async def accept_terms(self, user_id: str, version: str) -> None:
+        def mutate(data: dict):
+            data.setdefault("terms", {})[str(user_id)] = {"version": str(version), "ts": time.time()}
+        await self._store.aupdate(mutate)
+
+    # ---------- управление подпиской пользователем ----------
+    async def usage_today(self, user_id: str) -> int:
+        usage = ((await self._store.aread()).get("usage") or {}).get(str(user_id), {})
+        return int(usage.get("count", 0)) if usage.get("day") == _today() else 0
+
+    async def user_payments(self, user_id: str, limit: int = 5) -> List[dict]:
+        log = (await self._store.aread()).get("payment_log") or []
+        return [p for p in reversed(log) if p.get("user") == str(user_id) and not p.get("test")][:limit]
+
+    async def cancel_subscription(self, user_id: str) -> Optional[dict]:
+        """Досрочно завершает платную подписку (остаток срока сгорает). Возвращает {'plan', 'expires'} или None, если подписки нет."""
+        uid = str(user_id)
+
+        def mutate(data: dict):
+            plan, expires = _active_plan(data, uid)
+            if plan == "free":
+                return None
+            (data.get("users") or {}).pop(uid, None)
+            return {"plan": plan, "expires": expires}
+
+        return await self._store.aupdate(mutate)
+
     # ---------- рефералы ----------
     async def register_referral(self, new_user: str, referrer: str, is_new: bool = True) -> dict:
         """Привязывает нового пользователя к пригласившему и начисляет бонусные генерации обоим."""
@@ -363,7 +445,7 @@ class SubscriptionService:
             if REF_SIGNUP_CREDITS > 0:
                 credits = data.setdefault("credits", {})
                 for uid in (new_user, referrer):
-                    credits[uid] = int(credits.get(uid, 0)) + REF_SIGNUP_CREDITS
+                    credits[uid] = round(float(credits.get(uid, 0)) + REF_SIGNUP_CREDITS, 2)
             return {"ok": True, "credits": REF_SIGNUP_CREDITS}
 
         return await self._store.aupdate(mutate)
@@ -373,7 +455,7 @@ class SubscriptionService:
         uid = str(user_id)
         invited = [u for u, r in (data.get("referrals") or {}).items() if r == uid]
         return {"invited": len(invited), "paid": sum(1 for u in invited if u in (data.get("ref_rewarded") or {})),
-                "credits": int((data.get("credits") or {}).get(uid, 0)), "referrer": (data.get("referrals") or {}).get(uid)}
+                "credits": float((data.get("credits") or {}).get(uid, 0)), "referrer": (data.get("referrals") or {}).get(uid)}
 
     # ---------- тексты и статистика ----------
     async def describe(self, user_id: str, bot_username: Optional[str] = None) -> str:
@@ -384,15 +466,11 @@ class SubscriptionService:
         uid = str(user_id)
         plan, expires = _active_plan(data, uid)
         info = PLANS[plan]
-        usage = (data.get("usage") or {}).get(uid, {})
-        used = usage.get("count", 0) if usage.get("day") == _today() else 0
-        limit = f"{used}/{info['daily']}" if info["daily"] is not None else f"{used} (без лимита)"
         ref = await self.referral_info(uid)
         lines = [
             f"💳 <b>Ваш тариф: {info['title']}</b>" + (f" ({fmt_expires(expires)})" if plan != "free" else ""),
-            f"🎨 Генераций сегодня: {limit}",
-            f"🎁 Бонусных генераций: {ref['credits']}",
-            f"🎭 Функции лиц: {'доступны' if info['face'] else 'только на Pro'}",
+            "🪙 Токены: не тратятся на Pro" if plan == "pro" else f"🪙 Токенов: {fmt_tokens(ref['credits'])}",
+            f"Цены: генерация — {fmt_tokens(COST_GENERATION)}, с лицом — {fmt_tokens(COST_FACE)}, апскейл — {fmt_tokens(COST_UPSCALE)}",
             f"🎛️ Тонкая настройка генерации: {'доступна' if info['advanced'] else 'только на Pro'}",
         ]
         if data.get("payments"):
@@ -406,7 +484,7 @@ class SubscriptionService:
     async def _referral_lines(self, uid: str, bot_username: Optional[str], ref: Optional[dict] = None) -> List[str]:
         ref = ref or await self.referral_info(uid)
         lines = ["", "👥 <b>Приглашайте друзей</b>",
-                 f"Вам и другу — по {REF_SIGNUP_CREDITS} бонусных генераций; когда друг оформит подписку, вы получите {REF_PURCHASE_DAYS} дн. Pro."]
+                 f"Вам и другу — по {fmt_tokens(REF_SIGNUP_CREDITS)} токенов; когда друг оформит подписку, вы получите {REF_PURCHASE_DAYS} дн. Pro."]
         if bot_username:
             lines.append(f"<code>https://t.me/{bot_username}?start=ref_{uid}</code>")
         lines.append(f"Приглашено: {ref['invited']}, из них оплатили: {ref['paid']}")
@@ -460,6 +538,8 @@ revoke = service.revoke
 reset_usage = service.reset_usage
 add_credits = service.add_credits
 check_and_consume = service.check_and_consume
+claim_welcome = service.claim_welcome
+balance = service.balance
 refund = service.refund
 feature_allowed = service.feature_allowed
 process_payment = service.process_payment
@@ -471,3 +551,8 @@ describe = service.describe
 describe_referral = service.describe_referral
 stats = service.stats
 list_users = service.list_users
+terms_accepted = service.terms_accepted
+accept_terms = service.accept_terms
+user_payments = service.user_payments
+usage_today = service.usage_today
+cancel_subscription = service.cancel_subscription

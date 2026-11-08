@@ -649,3 +649,75 @@ async def delete_preset(user_id: str, name: str) -> bool:
 
     await update_user_settings(user_id, mutator=mutator)
     return result["ok"]
+
+
+# ===== ОБЩИЕ ПРЕСЕТЫ (для всех пользователей, управляют администраторы) =====
+# Формат записи: {имя: {"settings": {ключи из PRESET_KEYS}, "desc": "короткое описание"}}.
+# Модель и LoRA в готовых пресетах не заданы — применяется только то, что указано, остальное у пользователя не меняется.
+STANDARD_PRESET_NAME = "⚙️ Стандартные"
+MAX_GLOBAL_PRESETS = 12
+GLOBAL_PRESETS_FILE = os.path.join(os.path.dirname(SETTINGS_FILE) or ".", "global_presets.json")
+
+
+def _builtin_global_presets() -> Dict[str, dict]:
+    d = DEFAULT_SETTINGS
+    return {
+        STANDARD_PRESET_NAME: {
+            "desc": "вернуть обычные настройки",
+            "settings": {"width": d["width"], "height": d["height"], "steps": d["steps"], "cfg_scale": d["cfg_scale"],
+                         "sampler_name": d["sampler_name"], "diversity_mode": d["diversity_mode"], "negative_prompt": None,
+                         "hires_enabled": False, "hires_scale": d["hires_scale"], "hires_upscaler": d["hires_upscaler"],
+                         "hires_denoise": d["hires_denoise"]}},
+        "🧍 Портрет": {"desc": "вертикальный кадр, аккуратные детали",
+                      "settings": {"width": 512, "height": 768, "steps": 30, "cfg_scale": 6.5}},
+        "🏞 Пейзаж": {"desc": "широкий кадр для видов и сцен",
+                     "settings": {"width": 768, "height": 512, "steps": 30, "cfg_scale": 7.0}},
+        "⚡ Быстрый": {"desc": "квадрат и мало шагов, чтобы быстро попробовать идею",
+                      "settings": {"width": 512, "height": 512, "steps": 20, "cfg_scale": 6.0}},
+    }
+
+
+_GLOBAL_STORE = JsonStore(GLOBAL_PRESETS_FILE, default_factory=_builtin_global_presets)
+
+
+async def list_global_presets() -> Dict[str, dict]:
+    return dict(await _GLOBAL_STORE.aread())
+
+
+async def save_global_preset(admin_id: str, name: str, desc: str = "") -> str:
+    """Сохраняет текущие настройки администратора как общий пресет. 'new' | 'updated' | 'limit'."""
+    current = await get_user_settings(admin_id)
+    snapshot = {key: copy.deepcopy(current.get(key)) for key in PRESET_KEYS}
+
+    def mutator(presets: dict):
+        if name not in presets and len(presets) >= MAX_GLOBAL_PRESETS:
+            return "limit"
+        status = "updated" if name in presets else "new"
+        presets[name] = {"settings": snapshot, "desc": desc or (presets.get(name) or {}).get("desc", "")}
+        return status
+
+    return await _GLOBAL_STORE.aupdate(mutator)
+
+
+async def delete_global_preset(name: str) -> bool:
+    if name == STANDARD_PRESET_NAME:        # «Стандартные» нужны всем как кнопка сброса — перезаписать можно, удалить нельзя
+        return False
+    return bool(await _GLOBAL_STORE.aupdate(lambda presets: presets.pop(name, None) is not None))
+
+
+async def apply_global_preset(user_id: str, name: str) -> bool:
+    entry = (await list_global_presets()).get(name)
+    if entry is None:
+        return False
+
+    def mutator(settings: dict):
+        for key, value in (entry.get("settings") or {}).items():
+            if key not in PRESET_KEYS:
+                continue
+            if key == "negative_prompt" and value is None:
+                settings.pop("negative_prompt", None)
+            else:
+                settings[key] = copy.deepcopy(value)
+
+    await update_user_settings(user_id, mutator=mutator)
+    return True

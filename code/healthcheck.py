@@ -255,15 +255,16 @@ async def selftest_subscriptions() -> List[CheckResult]:
             if await svc.check_and_consume("900001") is not None:
                 return "при выключенных подписках лимит применился"
             await svc.set_enabled(True)
-            for i in range(S.FREE_DAILY_LIMIT):
+            await svc.add_credits("900001", 3)
+            for i in range(3):
                 if await svc.check_and_consume("900001") is not None:
-                    return f"отказ до лимита на {i + 1}-й генерации"
+                    return f"отказ при хватающих токенах на {i + 1}-й генерации"
             if await svc.check_and_consume("900001") is None:
-                return "лимит Free не сработал"
+                return "генерация прошла без токенов"
             await svc.grant("900002", "pro", days=1)
             if await svc.check_and_consume("900002") is not None:
-                return "Pro получил отказ по лимиту"
-            if await svc.feature_allowed("900001", "face") or not await svc.feature_allowed("900002", "face"):
+                return "Pro получил отказ по токенам"
+            if not await svc.feature_allowed("900002", "face"):
                 return "доступ к функциям лиц выдан неверно"
 
         async def expiry():
@@ -317,16 +318,19 @@ async def selftest_subscriptions() -> List[CheckResult]:
                 return "реферальный бонус начислен повторно"
 
         async def credits():
-            await svc.add_credits("900001", 1)
-            if await svc.check_and_consume("900001") is not None:
-                return "бонусная генерация не потратилась при исчерпанном лимите"
-            if await svc.check_and_consume("900001") is None:
-                return "бонус потратился дважды"
-            await svc.add_credits("900001", 1)
-            await svc.check_and_consume("900001")
-            await svc.refund("900001")
-            if (await svc.referral_info("900001"))["credits"] != 1:
-                return "возврат не восстановил бонусную генерацию"
+            u = "900010"
+            if await svc.claim_welcome(u) != S.WELCOME_TOKENS or await svc.claim_welcome(u) != 0:
+                return "приветственные токены выданы неверно (должны один раз)"
+            await svc.add_credits(u, S.COST_FACE - S.WELCOME_TOKENS)       # итого ровно на одну генерацию с лицом
+            if await svc.check_and_consume(u, S.COST_FACE) is not None or await svc.balance(u) != 0:
+                return "генерация с лицом списала неверную сумму"
+            if await svc.check_and_consume(u, S.COST_UPSCALE) is None:
+                return "апскейл прошёл без токенов"
+            await svc.add_credits(u, 1)
+            await svc.check_and_consume(u, S.COST_UPSCALE)
+            await svc.refund(u)
+            if await svc.balance(u) != 1:
+                return "возврат не восстановил токены"
 
         async def access_levels():
             import admin_console
@@ -600,7 +604,7 @@ async def _check_poses() -> CheckResult:
     sources = await get_controlnet_sources(force_refresh=True)
     if sources:
         return _r(G_OPT, "База поз ControlNet", OK, f"{len(sources)} шт.")
-    return _r(G_OPT, "База поз ControlNet", WARN, "пуста", "Положите parquet-датасеты в code/controlnet_images/<категория>/")
+    return _r(G_OPT, "База поз ControlNet", WARN, "пуста", "Положите parquet-датасеты в code/data/controlnet_images/<категория>/")
 
 
 # ===================== ЗАПУСК И ОТЧЁТ =====================

@@ -17,7 +17,30 @@ import pandas as pd
 from Aapi import generate_with_progress, build_negative_prompt, apply_model_override, fit_dims_to_image, MAX_SEED, _b64encode, decode_base64_to_bytes, apply_faceid_to_payload
 
 # ===== КОНФИГУРАЦИЯ =====
-CONTROLNET_IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "controlnet_images")
+try:
+    from app_config import CONTROLNET_IMAGES_DIR
+except ImportError:
+    CONTROLNET_IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "controlnet_images")
+
+
+def _migrate_legacy_images_dir() -> None:
+    """Один раз переносит старую папку code/controlnet_images в data/controlnet_images (если новая ещё пуста)."""
+    import shutil
+    legacy = os.path.join(os.path.dirname(os.path.abspath(__file__)), "controlnet_images")
+    if os.path.abspath(legacy) == os.path.abspath(CONTROLNET_IMAGES_DIR) or not os.path.isdir(legacy):
+        return
+    os.makedirs(CONTROLNET_IMAGES_DIR, exist_ok=True)
+    if os.listdir(CONTROLNET_IMAGES_DIR):
+        return
+    for name in os.listdir(legacy):
+        shutil.move(os.path.join(legacy, name), os.path.join(CONTROLNET_IMAGES_DIR, name))
+    print(f"📦 Позы ControlNet перенесены: {legacy} → {CONTROLNET_IMAGES_DIR}")
+
+
+try:
+    _migrate_legacy_images_dir()
+except OSError as error:
+    print(f"⚠️ Не удалось перенести controlnet_images в data/: {error}")
 
 # Кэш для Parquet-файлов
 _parquet_cache = {}
